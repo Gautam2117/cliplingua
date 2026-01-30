@@ -1,0 +1,32 @@
+# node
+node_modules/
+.next/
+out/
+dist/
+.vercel/
+*.log
+
+# env
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.envrc
+.pytest_cache/
+
+# worker runtime files
+worker/tmp/
+worker/data/
+worker/*.db
+worker/*.sqlite
+worker/.env
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
