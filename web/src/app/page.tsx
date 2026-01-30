@@ -1,3 +1,5 @@
+import WaitlistForm from "@/components/WaitlistForm";
+
 export default function Home() {
   return (
     <main className="min-h-screen flex items-center justify-center px-6">
@@ -13,15 +15,8 @@ export default function Home() {
           Ready to publish to Reels, Shorts, TikTok.
         </p>
 
-        <div className="mt-8 flex gap-2">
-          <input
-            className="border rounded-md px-4 py-3 flex-1"
-            type="email"
-            placeholder="you@example.com"
-          />
-          <button className="rounded-md px-5 py-3 bg-black text-white">
-            Join waitlist
-          </button>
+        <div className="mt-8">
+          <WaitlistForm />
         </div>
 
         <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm opacity-80">
