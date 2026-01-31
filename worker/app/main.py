@@ -167,7 +167,12 @@ def process_job(job_id: str, url: str):
         if rc2 != 0 or not wait_for_file(out_audio, min_bytes=1024 * 10):
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
+            out_log.write_text("\n".join(log_lines), encoding="utf-8")
             raise RuntimeError("audio extraction failed")
+
+        log_lines.append("== DONE ==")
+        log_lines.append(f"video={merged_video.resolve()}")
+        log_lines.append(f"audio={out_audio.resolve()}")
 
         out_log.write_text("\n".join(log_lines), encoding="utf-8")
 
