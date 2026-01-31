@@ -10,3 +10,16 @@ worker/data/
 # node
 **/node_modules/
 **/.next/
+
+# cliplingua local outputs
+out.mp4
+out.wav
+tmp/
+data/
+*.mp4
+*.wav
+
+# python
+__pycache__/
+*.pyc
+.venv/

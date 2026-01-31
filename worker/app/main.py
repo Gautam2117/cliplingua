@@ -1,10 +1,11 @@
 import os
+import sys
 import json
 import uuid
 import time
 import subprocess
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, FileResponse, Response
@@ -19,26 +20,37 @@ TMP_DIR = Path(os.getenv("TMP_DIR", "./tmp"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="ClipLingua Worker", version="0.2.0")
+app = FastAPI(title="ClipLingua Worker", version="0.3.0")
 
 
 class CreateJobBody(BaseModel):
     url: HttpUrl
 
 
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
 def job_path(job_id: str) -> Path:
     return DATA_DIR / f"{job_id}.json"
 
 
-def save_job(job_id: str, payload: dict):
+def save_job(job_id: str, payload: Dict[str, Any]) -> None:
     job_path(job_id).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def load_job(job_id: str) -> dict:
+def load_job(job_id: str) -> Dict[str, Any]:
     p = job_path(job_id)
     if not p.exists():
         raise HTTPException(status_code=404, detail="job not found")
     return json.loads(p.read_text(encoding="utf-8"))
+
+
+def update_job(job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    job = load_job(job_id)
+    job.update(patch)
+    save_job(job_id, job)
+    return job
 
 
 def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
@@ -52,7 +64,7 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
-def wait_for_file(path: Path, min_bytes: int, tries: int = 120, sleep_s: float = 0.25) -> bool:
+def wait_for_file(path: Path, min_bytes: int, tries: int = 140, sleep_s: float = 0.25) -> bool:
     for _ in range(tries):
         try:
             if path.exists() and path.is_file() and path.stat().st_size >= min_bytes:
@@ -65,7 +77,7 @@ def wait_for_file(path: Path, min_bytes: int, tries: int = 120, sleep_s: float =
 
 def list_dir(folder: Path) -> str:
     try:
-        items = []
+        items: List[str] = []
         for p in sorted(folder.rglob("*")):
             rel = p.relative_to(folder)
             if p.is_dir():
@@ -87,11 +99,10 @@ def safe_file_or_404(path_str: str, msg: str) -> Path:
     return p
 
 
-def process_job(job_id: str, url: str):
+def process_job(job_id: str, url: str) -> None:
     tmp_job_dir = TMP_DIR / job_id
     tmp_job_dir.mkdir(parents=True, exist_ok=True)
 
-    # Because we set cwd=tmp_job_dir, use filename-only for outputs in that folder
     out_template = "download.%(ext)s"
     merged_name = "download.mp4"
     audio_name = "audio.wav"
@@ -100,15 +111,19 @@ def process_job(job_id: str, url: str):
     out_audio = tmp_job_dir / audio_name
     out_log = tmp_job_dir / "log.txt"
 
-    job = load_job(job_id)
-    job["status"] = "running"
-    job["updated_at"] = time.time()
-    save_job(job_id, job)
+    update_job(
+        job_id,
+        {
+            "status": "running",
+            "updated_at": now_iso(),
+            "updated_at_ts": time.time(),
+        },
+    )
 
     log_lines: List[str] = []
 
     try:
-        # 1) Download via yt-dlp with JS runtime (node) and force merged mp4
+        # 1) yt-dlp download + merge to mp4
         dl_cmd = [
             "yt-dlp",
             "--js-runtimes",
@@ -132,30 +147,17 @@ def process_job(job_id: str, url: str):
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError(f"download failed (rc={rc})")
 
-        # yt-dlp merge can finish after the process exits on some hosts.
         if not wait_for_file(merged_video, min_bytes=1024 * 200):
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError("download produced no merged mp4")
 
-        # 2) Extract audio (16k mono wav)
-        # Use relative names because cwd is tmp_job_dir
-        ff_cmd_rel = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            merged_name,
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            audio_name,
-        ]
+        # 2) ffmpeg audio extraction (16k mono wav)
+        ff_cmd_rel = ["ffmpeg", "-y", "-i", merged_name, "-ac", "1", "-ar", "16000", audio_name]
         rc2, out2 = run_cmd(ff_cmd_rel, cwd=tmp_job_dir)
         log_lines.append("== ffmpeg ==")
         log_lines.append(out2)
 
-        # Fallback: if ffmpeg failed, run without cwd using absolute paths
         if rc2 != 0:
             ff_cmd_abs = [
                 "ffmpeg",
@@ -176,7 +178,6 @@ def process_job(job_id: str, url: str):
         if rc2 != 0 or not wait_for_file(out_audio, min_bytes=1024 * 10):
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
-            out_log.write_text("\n".join(log_lines), encoding="utf-8")
             raise RuntimeError("audio extraction failed")
 
         log_lines.append("== DONE ==")
@@ -185,30 +186,54 @@ def process_job(job_id: str, url: str):
 
         out_log.write_text("\n".join(log_lines), encoding="utf-8")
 
-        job = load_job(job_id)
-        job["status"] = "done"
-        job["updated_at"] = time.time()
-        job["error"] = None
-        job["video_path"] = str(merged_video.resolve())
-        job["audio_path"] = str(out_audio.resolve())
-        job["log_path"] = str(out_log.resolve())
-        save_job(job_id, job)
+        update_job(
+            job_id,
+            {
+                "status": "done",
+                "error": None,
+                "video_path": str(merged_video.resolve()),
+                "audio_path": str(out_audio.resolve()),
+                "log_path": str(out_log.resolve()),
+                "updated_at": now_iso(),
+                "updated_at_ts": time.time(),
+            },
+        )
 
     except Exception as e:
-        out_log.write_text("\n".join(log_lines) + f"\nERROR: {e}\n", encoding="utf-8")
-        job = load_job(job_id)
-        job["status"] = "error"
-        job["updated_at"] = time.time()
-        job["error"] = str(e)
-        job["video_path"] = None
-        job["audio_path"] = None
-        job["log_path"] = str(out_log.resolve())
-        save_job(job_id, job)
+        try:
+            out_log.write_text("\n".join(log_lines) + f"\nERROR: {e}\n", encoding="utf-8")
+        except Exception:
+            pass
+
+        update_job(
+            job_id,
+            {
+                "status": "error",
+                "error": str(e),
+                "video_path": None,
+                "audio_path": None,
+                "log_path": str(out_log.resolve()),
+                "updated_at": now_iso(),
+                "updated_at_ts": time.time(),
+            },
+        )
 
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/routes")
+def routes():
+    out = []
+    for r in app.router.routes:
+        methods = sorted(list(getattr(r, "methods", []) or []))
+        path = getattr(r, "path", "")
+        name = getattr(r, "name", "")
+        if path:
+            out.append({"path": path, "methods": methods, "name": name})
+    return {"routes": out}
 
 
 @app.post("/jobs")
@@ -223,17 +248,30 @@ def create_job(body: CreateJobBody):
         "video_path": None,
         "audio_path": None,
         "log_path": None,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "updated_at_ts": time.time(),
     }
     save_job(job_id, payload)
 
-    # Fire-and-forget background process
+    # Safer than string interpolation into Python code:
+    # pass params via env and run a tiny inline runner.
+    env = os.environ.copy()
+    env["CLIPLINGUA_JOB_ID"] = job_id
+    env["CLIPLINGUA_JOB_URL"] = str(body.url)
+
+    runner = (
+        "import os;"
+        "from app.main import process_job;"
+        "process_job(os.environ['CLIPLINGUA_JOB_ID'], os.environ['CLIPLINGUA_JOB_URL'])"
+    )
+
     subprocess.Popen(
-        ["python3", "-c", f"from app.main import process_job; process_job('{job_id}', '{body.url}')"],
+        [sys.executable, "-c", runner],
         cwd=str(Path(__file__).resolve().parents[1]),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=env,
     )
 
     return {"jobId": job_id}
@@ -254,6 +292,15 @@ def get_job_log(job_id: str):
     return p.read_text(encoding="utf-8", errors="ignore")
 
 
+def _file_head_or_404(path_str: Optional[str]) -> Response:
+    if not path_str:
+        return Response(status_code=404)
+    p = Path(path_str)
+    if not p.exists() or not p.is_file():
+        return Response(status_code=404)
+    return Response(status_code=200)
+
+
 @app.get("/jobs/{job_id}/audio")
 def get_job_audio(job_id: str):
     job = load_job(job_id)
@@ -261,23 +308,13 @@ def get_job_audio(job_id: str):
     if not ap:
         raise HTTPException(status_code=404, detail="audio not ready")
     p = safe_file_or_404(ap, "audio file missing")
-    return FileResponse(
-        path=str(p),
-        media_type="audio/wav",
-        filename=f"{job_id}.wav",
-    )
+    return FileResponse(path=str(p), media_type="audio/wav", filename=f"{job_id}.wav")
 
 
 @app.head("/jobs/{job_id}/audio")
 def head_job_audio(job_id: str):
     job = load_job(job_id)
-    ap = job.get("audio_path")
-    if not ap:
-        return Response(status_code=404)
-    p = Path(ap)
-    if not p.exists() or not p.is_file():
-        return Response(status_code=404)
-    return Response(status_code=200)
+    return _file_head_or_404(job.get("audio_path"))
 
 
 @app.get("/jobs/{job_id}/video")
@@ -287,20 +324,10 @@ def get_job_video(job_id: str):
     if not vp:
         raise HTTPException(status_code=404, detail="video not ready")
     p = safe_file_or_404(vp, "video file missing")
-    return FileResponse(
-        path=str(p),
-        media_type="video/mp4",
-        filename=f"{job_id}.mp4",
-    )
+    return FileResponse(path=str(p), media_type="video/mp4", filename=f"{job_id}.mp4")
 
 
 @app.head("/jobs/{job_id}/video")
 def head_job_video(job_id: str):
     job = load_job(job_id)
-    vp = job.get("video_path")
-    if not vp:
-        return Response(status_code=404)
-    p = Path(vp)
-    if not p.exists() or not p.is_file():
-        return Response(status_code=404)
-    return Response(status_code=200)
+    return _file_head_or_404(job.get("video_path"))
