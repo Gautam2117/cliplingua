@@ -125,9 +125,9 @@ def process_job(job_id: str, url: str):
         job["status"] = "done"
         job["updated_at"] = time.time()
         job["error"] = None
-        job["video_path"] = str(out_video)
-        job["audio_path"] = str(out_audio)
-        job["log_path"] = str(out_log)
+        job["video_path"] = str(out_video.resolve())
+        job["audio_path"] = str(out_audio.resolve())
+        job["log_path"] = str(out_log.resolve())
         save_job(job_id, job)
 
     except Exception as e:
@@ -138,7 +138,7 @@ def process_job(job_id: str, url: str):
         job["error"] = str(e)
         job["video_path"] = None
         job["audio_path"] = None
-        job["log_path"] = str(out_log)
+        job["log_path"] = str(out_log.resolve())
         save_job(job_id, job)
 
 
