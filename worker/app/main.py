@@ -51,7 +51,7 @@ def run_cmd(cmd: list[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
-def wait_for_file(path: Path, min_bytes: int, tries: int = 20, sleep_s: float = 0.25) -> bool:
+def wait_for_file(path: Path, min_bytes: int, tries: int = 40, sleep_s: float = 0.25) -> bool:
     for _ in range(tries):
         if path.exists():
             try:
@@ -63,11 +63,29 @@ def wait_for_file(path: Path, min_bytes: int, tries: int = 20, sleep_s: float = 
     return False
 
 
+def list_dir(folder: Path) -> str:
+    try:
+        items = []
+        for p in sorted(folder.rglob("*")):
+            rel = p.relative_to(folder)
+            if p.is_dir():
+                items.append(f"[DIR]  {rel}")
+            else:
+                try:
+                    items.append(f"[FILE] {rel} ({p.stat().st_size} bytes)")
+                except Exception:
+                    items.append(f"[FILE] {rel} (size?)")
+        return "\n".join(items) if items else "<empty>"
+    except Exception as e:
+        return f"<could not list dir: {e}>"
+
+
 def process_job(job_id: str, url: str):
     tmp_job_dir = TMP_DIR / job_id
     tmp_job_dir.mkdir(parents=True, exist_ok=True)
 
-    out_template = tmp_job_dir / "download.%(ext)s"
+    # IMPORTANT: since we set cwd=tmp_job_dir, output must be filename-only
+    out_template = "download.%(ext)s"
     merged_video = tmp_job_dir / "download.mp4"
     out_audio = tmp_job_dir / "audio.wav"
     out_log = tmp_job_dir / "log.txt"
@@ -80,7 +98,6 @@ def process_job(job_id: str, url: str):
     log_lines: list[str] = []
 
     try:
-        # 1) Download and merge into download.mp4
         dl_cmd = [
             "yt-dlp",
             "--js-runtimes",
@@ -91,7 +108,7 @@ def process_job(job_id: str, url: str):
             "--merge-output-format",
             "mp4",
             "-o",
-            str(out_template),
+            out_template,
             str(url),
         ]
 
@@ -99,22 +116,17 @@ def process_job(job_id: str, url: str):
         log_lines.append("== yt-dlp ==")
         log_lines.append(out)
 
-        # yt-dlp may exit 0 even if nothing usable was produced.
-        # We deterministically expect download.mp4 after merge.
         if rc != 0:
+            log_lines.append("== tmp dir listing ==")
+            log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError(f"download failed (rc={rc})")
 
-        if not wait_for_file(merged_video, min_bytes=1024 * 200):  # 200KB sanity
-            # dump directory listing for debugging
-            try:
-                files = "\n".join(sorted([p.name for p in tmp_job_dir.iterdir()]))
-            except Exception:
-                files = "<could not list tmp dir>"
+        # wait for merged file
+        if not wait_for_file(merged_video, min_bytes=1024 * 200):
             log_lines.append("== tmp dir listing ==")
-            log_lines.append(files)
+            log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError("download produced no merged mp4")
 
-        # 2) Extract audio to wav (16k mono)
         ff_cmd = [
             "ffmpeg",
             "-y",
@@ -131,6 +143,8 @@ def process_job(job_id: str, url: str):
         log_lines.append(out2)
 
         if rc2 != 0 or not wait_for_file(out_audio, min_bytes=1024 * 10):
+            log_lines.append("== tmp dir listing ==")
+            log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError("audio extraction failed")
 
         out_log.write_text("\n".join(log_lines), encoding="utf-8")
