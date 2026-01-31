@@ -4,12 +4,12 @@ import uuid
 import time
 import subprocess
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse, FileResponse, Response
 from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
-from fastapi.responses import PlainTextResponse
-from fastapi.responses import FileResponse
 
 load_dotenv()
 
@@ -19,7 +19,7 @@ TMP_DIR = Path(os.getenv("TMP_DIR", "./tmp"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="ClipLingua Worker", version="0.1.0")
+app = FastAPI(title="ClipLingua Worker", version="0.2.0")
 
 
 class CreateJobBody(BaseModel):
@@ -41,7 +41,7 @@ def load_job(job_id: str) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def run_cmd(cmd: list[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
+def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     proc = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -52,10 +52,10 @@ def run_cmd(cmd: list[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
-def wait_for_file(path: Path, min_bytes: int, tries: int = 80, sleep_s: float = 0.25) -> bool:
+def wait_for_file(path: Path, min_bytes: int, tries: int = 120, sleep_s: float = 0.25) -> bool:
     for _ in range(tries):
         try:
-            if path.exists() and path.stat().st_size >= min_bytes:
+            if path.exists() and path.is_file() and path.stat().st_size >= min_bytes:
                 return True
         except FileNotFoundError:
             pass
@@ -80,6 +80,13 @@ def list_dir(folder: Path) -> str:
         return f"<could not list dir: {e}>"
 
 
+def safe_file_or_404(path_str: str, msg: str) -> Path:
+    p = Path(path_str)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail=msg)
+    return p
+
+
 def process_job(job_id: str, url: str):
     tmp_job_dir = TMP_DIR / job_id
     tmp_job_dir.mkdir(parents=True, exist_ok=True)
@@ -98,7 +105,7 @@ def process_job(job_id: str, url: str):
     job["updated_at"] = time.time()
     save_job(job_id, job)
 
-    log_lines: list[str] = []
+    log_lines: List[str] = []
 
     try:
         # 1) Download via yt-dlp with JS runtime (node) and force merged mp4
@@ -125,6 +132,7 @@ def process_job(job_id: str, url: str):
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError(f"download failed (rc={rc})")
 
+        # yt-dlp merge can finish after the process exits on some hosts.
         if not wait_for_file(merged_video, min_bytes=1024 * 200):
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
@@ -147,7 +155,7 @@ def process_job(job_id: str, url: str):
         log_lines.append("== ffmpeg ==")
         log_lines.append(out2)
 
-        # Fallback: if ffmpeg failed due to path weirdness, run without cwd using absolute paths
+        # Fallback: if ffmpeg failed, run without cwd using absolute paths
         if rc2 != 0:
             ff_cmd_abs = [
                 "ffmpeg",
@@ -220,6 +228,7 @@ def create_job(body: CreateJobBody):
     }
     save_job(job_id, payload)
 
+    # Fire-and-forget background process
     subprocess.Popen(
         ["python3", "-c", f"from app.main import process_job; process_job('{job_id}', '{body.url}')"],
         cwd=str(Path(__file__).resolve().parents[1]),
@@ -230,16 +239,20 @@ def create_job(body: CreateJobBody):
     return {"jobId": job_id}
 
 
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    return load_job(job_id)
+
+
 @app.get("/jobs/{job_id}/log", response_class=PlainTextResponse)
 def get_job_log(job_id: str):
     job = load_job(job_id)
     lp = job.get("log_path")
     if not lp:
         raise HTTPException(status_code=404, detail="log not ready")
-    p = Path(lp)
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="log file missing")
+    p = safe_file_or_404(lp, "log file missing")
     return p.read_text(encoding="utf-8", errors="ignore")
+
 
 @app.get("/jobs/{job_id}/audio")
 def get_job_audio(job_id: str):
@@ -247,14 +260,24 @@ def get_job_audio(job_id: str):
     ap = job.get("audio_path")
     if not ap:
         raise HTTPException(status_code=404, detail="audio not ready")
-    p = Path(ap)
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="audio file missing")
+    p = safe_file_or_404(ap, "audio file missing")
     return FileResponse(
         path=str(p),
         media_type="audio/wav",
         filename=f"{job_id}.wav",
     )
+
+
+@app.head("/jobs/{job_id}/audio")
+def head_job_audio(job_id: str):
+    job = load_job(job_id)
+    ap = job.get("audio_path")
+    if not ap:
+        return Response(status_code=404)
+    p = Path(ap)
+    if not p.exists() or not p.is_file():
+        return Response(status_code=404)
+    return Response(status_code=200)
 
 
 @app.get("/jobs/{job_id}/video")
@@ -263,15 +286,21 @@ def get_job_video(job_id: str):
     vp = job.get("video_path")
     if not vp:
         raise HTTPException(status_code=404, detail="video not ready")
-    p = Path(vp)
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="video file missing")
+    p = safe_file_or_404(vp, "video file missing")
     return FileResponse(
         path=str(p),
         media_type="video/mp4",
         filename=f"{job_id}.mp4",
     )
 
-@app.get("/jobs/{job_id}")
-def get_job(job_id: str):
-    return load_job(job_id)
+
+@app.head("/jobs/{job_id}/video")
+def head_job_video(job_id: str):
+    job = load_job(job_id)
+    vp = job.get("video_path")
+    if not vp:
+        return Response(status_code=404)
+    p = Path(vp)
+    if not p.exists() or not p.is_file():
+        return Response(status_code=404)
+    return Response(status_code=200)
