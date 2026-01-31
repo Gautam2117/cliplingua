@@ -51,18 +51,24 @@ def run_cmd(cmd: list[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
-def find_first_mp4(folder: Path) -> Optional[Path]:
-    # yt-dlp will write exactly one final mp4 for our use-case
-    mp4s = sorted(folder.glob("*.mp4"), key=lambda p: p.stat().st_size, reverse=True)
-    return mp4s[0] if mp4s else None
+def wait_for_file(path: Path, min_bytes: int, tries: int = 20, sleep_s: float = 0.25) -> bool:
+    for _ in range(tries):
+        if path.exists():
+            try:
+                if path.stat().st_size >= min_bytes:
+                    return True
+            except FileNotFoundError:
+                pass
+        time.sleep(sleep_s)
+    return False
 
 
 def process_job(job_id: str, url: str):
     tmp_job_dir = TMP_DIR / job_id
     tmp_job_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use a template, not a fixed file. yt-dlp controls final ext.
     out_template = tmp_job_dir / "download.%(ext)s"
+    merged_video = tmp_job_dir / "download.mp4"
     out_audio = tmp_job_dir / "audio.wav"
     out_log = tmp_job_dir / "log.txt"
 
@@ -74,8 +80,7 @@ def process_job(job_id: str, url: str):
     log_lines: list[str] = []
 
     try:
-        # 1) Download (YouTube requires JS runtime on many hosts)
-        #    --js-runtimes node enables yt-dlp JS challenge solving using node.
+        # 1) Download and merge into download.mp4
         dl_cmd = [
             "yt-dlp",
             "--js-runtimes",
@@ -94,17 +99,27 @@ def process_job(job_id: str, url: str):
         log_lines.append("== yt-dlp ==")
         log_lines.append(out)
 
-        # yt-dlp can exit 0 but still not produce mp4 (blocked formats, images only, etc.)
-        out_video = find_first_mp4(tmp_job_dir)
-        if rc != 0 or out_video is None or not out_video.exists() or out_video.stat().st_size < 1024 * 100:
+        # yt-dlp may exit 0 even if nothing usable was produced.
+        # We deterministically expect download.mp4 after merge.
+        if rc != 0:
             raise RuntimeError(f"download failed (rc={rc})")
+
+        if not wait_for_file(merged_video, min_bytes=1024 * 200):  # 200KB sanity
+            # dump directory listing for debugging
+            try:
+                files = "\n".join(sorted([p.name for p in tmp_job_dir.iterdir()]))
+            except Exception:
+                files = "<could not list tmp dir>"
+            log_lines.append("== tmp dir listing ==")
+            log_lines.append(files)
+            raise RuntimeError("download produced no merged mp4")
 
         # 2) Extract audio to wav (16k mono)
         ff_cmd = [
             "ffmpeg",
             "-y",
             "-i",
-            str(out_video),
+            str(merged_video),
             "-ac",
             "1",
             "-ar",
@@ -115,17 +130,16 @@ def process_job(job_id: str, url: str):
         log_lines.append("== ffmpeg ==")
         log_lines.append(out2)
 
-        if rc2 != 0 or not out_audio.exists() or out_audio.stat().st_size < 1024 * 10:
+        if rc2 != 0 or not wait_for_file(out_audio, min_bytes=1024 * 10):
             raise RuntimeError("audio extraction failed")
 
         out_log.write_text("\n".join(log_lines), encoding="utf-8")
 
-        # Store absolute-ish paths (relative to service). Keep consistent with your API schema.
         job = load_job(job_id)
         job["status"] = "done"
         job["updated_at"] = time.time()
         job["error"] = None
-        job["video_path"] = str(out_video.resolve())
+        job["video_path"] = str(merged_video.resolve())
         job["audio_path"] = str(out_audio.resolve())
         job["log_path"] = str(out_log.resolve())
         save_job(job_id, job)
@@ -173,6 +187,7 @@ def create_job(body: CreateJobBody):
 
     return {"jobId": job_id}
 
+
 @app.get("/jobs/{job_id}/log", response_class=PlainTextResponse)
 def get_job_log(job_id: str):
     job = load_job(job_id)
@@ -183,6 +198,7 @@ def get_job_log(job_id: str):
     if not p.exists():
         raise HTTPException(status_code=404, detail="log file missing")
     return p.read_text(encoding="utf-8", errors="ignore")
+
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
