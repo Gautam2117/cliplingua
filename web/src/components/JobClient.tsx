@@ -14,19 +14,7 @@ type Job = {
   updated_at: string;
 };
 
-const WORKER_BASE_URL =
-  process.env.NEXT_PUBLIC_WORKER_BASE_URL || process.env.WORKER_BASE_URL;
-
-async function signArtifact(path: string): Promise<string> {
-  const res = await fetch("/api/artifact", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path }),
-  });
-  if (!res.ok) throw new Error("Failed to sign url");
-  const data = (await res.json()) as { url: string };
-  return data.url;
-}
+type ArtifactType = "video" | "audio" | "log";
 
 export default function JobClient() {
   const [ytUrl, setYtUrl] = useState("");
@@ -34,6 +22,7 @@ export default function JobClient() {
   const [job, setJob] = useState<Job | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState<ArtifactType | null>(null);
 
   const canSubmit = useMemo(() => ytUrl.trim().length > 0 && !busy, [ytUrl, busy]);
 
@@ -44,38 +33,33 @@ export default function JobClient() {
     setJobId(null);
 
     try {
-      const base = WORKER_BASE_URL || "https://cliplingua.onrender.com";
-      const res = await fetch(`${base}/jobs`, {
+      const res = await fetch("/api/jobs/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: ytUrl.trim() }),
       });
 
-      if (!res.ok) {
-        const t = await res.text();
-        throw new Error(t || "Failed to create job");
-      }
-
+      if (!res.ok) throw new Error(await res.text());
       const data = (await res.json()) as { jobId: string };
       setJobId(data.jobId);
       setMsg("Job created. Processing...");
     } catch (e: any) {
-      setMsg(e?.message || "Something went wrong");
+      setMsg(e?.message || "Failed to create job");
       setBusy(false);
     }
   }
 
-  // poll
   useEffect(() => {
     if (!jobId) return;
 
     let alive = true;
-    const base = WORKER_BASE_URL || "https://cliplingua.onrender.com";
 
     async function tick() {
       try {
-        const res = await fetch(`${base}/jobs/${jobId}`, { cache: "no-store" });
-        if (!res.ok) throw new Error("Failed to fetch job");
+        const res = await fetch(`/api/jobs/status?jobId=${encodeURIComponent(jobId)}`, {
+          cache: "no-store",
+        });
+        if (!res.ok) throw new Error(await res.text());
         const data = (await res.json()) as Job;
 
         if (!alive) return;
@@ -92,7 +76,6 @@ export default function JobClient() {
           return;
         }
 
-        // keep polling
         setTimeout(tick, 2000);
       } catch (e: any) {
         if (!alive) return;
@@ -107,13 +90,26 @@ export default function JobClient() {
     };
   }, [jobId]);
 
-  async function download(path: string) {
+  async function download(type: ArtifactType) {
+    if (!jobId) return;
     setMsg(null);
+    setDownloading(type);
+
     try {
-      const url = await signArtifact(path);
-      window.open(url, "_blank", "noopener,noreferrer");
+      const res = await fetch("/api/jobs/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId, type }),
+      });
+
+      if (!res.ok) throw new Error(await res.text());
+      const data = (await res.json()) as { url: string };
+
+      window.open(data.url, "_blank", "noopener,noreferrer");
     } catch (e: any) {
-      setMsg(e?.message || "Failed to download");
+      setMsg(e?.message || "Download failed");
+    } finally {
+      setDownloading(null);
     }
   }
 
@@ -153,30 +149,29 @@ export default function JobClient() {
 
           {job.status === "done" && (
             <div className="mt-4 flex flex-wrap gap-2">
-              {job.video_path && (
-                <button
-                  onClick={() => download(job.video_path!)}
-                  className="border rounded-md px-4 py-2"
-                >
-                  Download video
-                </button>
-              )}
-              {job.audio_path && (
-                <button
-                  onClick={() => download(job.audio_path!)}
-                  className="border rounded-md px-4 py-2"
-                >
-                  Download audio
-                </button>
-              )}
-              {job.log_path && (
-                <button
-                  onClick={() => download(job.log_path!)}
-                  className="border rounded-md px-4 py-2"
-                >
-                  Download log
-                </button>
-              )}
+              <button
+                onClick={() => download("video")}
+                className="border rounded-md px-4 py-2 disabled:opacity-60"
+                disabled={!!downloading}
+              >
+                {downloading === "video" ? "Preparing..." : "Download video"}
+              </button>
+
+              <button
+                onClick={() => download("audio")}
+                className="border rounded-md px-4 py-2 disabled:opacity-60"
+                disabled={!!downloading}
+              >
+                {downloading === "audio" ? "Preparing..." : "Download audio"}
+              </button>
+
+              <button
+                onClick={() => download("log")}
+                className="border rounded-md px-4 py-2 disabled:opacity-60"
+                disabled={!!downloading}
+              >
+                {downloading === "log" ? "Preparing..." : "Download log"}
+              </button>
             </div>
           )}
         </div>

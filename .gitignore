@@ -1,25 +1,55 @@
-# python
-**/.venv/
-**/__pycache__/
-*.pyc
+# OS
+.DS_Store
+Thumbs.db
 
-# worker artifacts
-worker/tmp/
-worker/data/
+# Env
+.env
+.env.*
+!.env.example
 
-# node
-**/node_modules/
-**/.next/
+# Node / Next
+node_modules/
+.next/
+out/
+dist/
+.vercel/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-# cliplingua local outputs
-out.mp4
-out.wav
-tmp/
-data/
-*.mp4
-*.wav
-
-# python
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .venv/
+venv/
+env/
+pip-wheel-metadata/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Worker runtime artifacts (IMPORTANT)
+tmp/
+data/
+worker/tmp/
+worker/data/
+**/tmp/**
+**/data/**
+*.log
+log.txt
+download.*
+audio.wav
+out.wav
+out.mp4
+
+# Zip / artifacts
+*.zip
+*.tar
+*.tar.gz
+
+# IDE
+.vscode/
+.idea/
