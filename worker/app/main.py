@@ -51,14 +51,13 @@ def run_cmd(cmd: list[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
-def wait_for_file(path: Path, min_bytes: int, tries: int = 40, sleep_s: float = 0.25) -> bool:
+def wait_for_file(path: Path, min_bytes: int, tries: int = 80, sleep_s: float = 0.25) -> bool:
     for _ in range(tries):
-        if path.exists():
-            try:
-                if path.stat().st_size >= min_bytes:
-                    return True
-            except FileNotFoundError:
-                pass
+        try:
+            if path.exists() and path.stat().st_size >= min_bytes:
+                return True
+        except FileNotFoundError:
+            pass
         time.sleep(sleep_s)
     return False
 
@@ -84,10 +83,13 @@ def process_job(job_id: str, url: str):
     tmp_job_dir = TMP_DIR / job_id
     tmp_job_dir.mkdir(parents=True, exist_ok=True)
 
-    # IMPORTANT: since we set cwd=tmp_job_dir, output must be filename-only
+    # Because we set cwd=tmp_job_dir, use filename-only for outputs in that folder
     out_template = "download.%(ext)s"
-    merged_video = tmp_job_dir / "download.mp4"
-    out_audio = tmp_job_dir / "audio.wav"
+    merged_name = "download.mp4"
+    audio_name = "audio.wav"
+
+    merged_video = tmp_job_dir / merged_name
+    out_audio = tmp_job_dir / audio_name
     out_log = tmp_job_dir / "log.txt"
 
     job = load_job(job_id)
@@ -98,6 +100,7 @@ def process_job(job_id: str, url: str):
     log_lines: list[str] = []
 
     try:
+        # 1) Download via yt-dlp with JS runtime (node) and force merged mp4
         dl_cmd = [
             "yt-dlp",
             "--js-runtimes",
@@ -121,26 +124,45 @@ def process_job(job_id: str, url: str):
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError(f"download failed (rc={rc})")
 
-        # wait for merged file
         if not wait_for_file(merged_video, min_bytes=1024 * 200):
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError("download produced no merged mp4")
 
-        ff_cmd = [
+        # 2) Extract audio (16k mono wav)
+        # Use relative names because cwd is tmp_job_dir
+        ff_cmd_rel = [
             "ffmpeg",
             "-y",
             "-i",
-            str(merged_video),
+            merged_name,
             "-ac",
             "1",
             "-ar",
             "16000",
-            str(out_audio),
+            audio_name,
         ]
-        rc2, out2 = run_cmd(ff_cmd, cwd=tmp_job_dir)
+        rc2, out2 = run_cmd(ff_cmd_rel, cwd=tmp_job_dir)
         log_lines.append("== ffmpeg ==")
         log_lines.append(out2)
+
+        # Fallback: if ffmpeg failed due to path weirdness, run without cwd using absolute paths
+        if rc2 != 0:
+            ff_cmd_abs = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(merged_video.resolve()),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(out_audio.resolve()),
+            ]
+            rc2b, out2b = run_cmd(ff_cmd_abs, cwd=None)
+            log_lines.append("== ffmpeg (fallback abs) ==")
+            log_lines.append(out2b)
+            rc2 = rc2b
 
         if rc2 != 0 or not wait_for_file(out_audio, min_bytes=1024 * 10):
             log_lines.append("== tmp dir listing ==")
