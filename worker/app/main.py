@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
 from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse
 
 load_dotenv()
 
@@ -240,6 +241,36 @@ def get_job_log(job_id: str):
         raise HTTPException(status_code=404, detail="log file missing")
     return p.read_text(encoding="utf-8", errors="ignore")
 
+@app.get("/jobs/{job_id}/audio")
+def get_job_audio(job_id: str):
+    job = load_job(job_id)
+    ap = job.get("audio_path")
+    if not ap:
+        raise HTTPException(status_code=404, detail="audio not ready")
+    p = Path(ap)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="audio file missing")
+    return FileResponse(
+        path=str(p),
+        media_type="audio/wav",
+        filename=f"{job_id}.wav",
+    )
+
+
+@app.get("/jobs/{job_id}/video")
+def get_job_video(job_id: str):
+    job = load_job(job_id)
+    vp = job.get("video_path")
+    if not vp:
+        raise HTTPException(status_code=404, detail="video not ready")
+    p = Path(vp)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="video file missing")
+    return FileResponse(
+        path=str(p),
+        media_type="video/mp4",
+        filename=f"{job_id}.mp4",
+    )
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
