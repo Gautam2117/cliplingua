@@ -7,9 +7,17 @@ type Job = {
   url: string;
   status: "queued" | "running" | "done" | "error";
   error: string | null;
+
+  // local paths (worker-side)
   video_path: string | null;
   audio_path: string | null;
   log_path: string | null;
+
+  // URLs (if worker PUBLIC_BASE_URL set, else null)
+  video_url?: string | null;
+  audio_url?: string | null;
+  log_url?: string | null;
+
   created_at: string;
   updated_at: string;
 };
@@ -33,15 +41,20 @@ export default function JobClient() {
     setJobId(null);
 
     try {
-      const res = await fetch("/api/jobs/create", {
+      const res = await fetch("/api/clip/submit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: ytUrl.trim() }),
       });
 
-      if (!res.ok) throw new Error(await res.text());
-      const data = (await res.json()) as { jobId: string };
-      setJobId(data.jobId);
+      const text = await res.text();
+      if (!res.ok) throw new Error(text || `Request failed (${res.status})`);
+
+      const data = JSON.parse(text) as any;
+      const id: string | undefined = data?.jobId ?? data?.id;
+      if (!id) throw new Error("Worker did not return a job id");
+
+      setJobId(id);
       setMsg("Job created. Processing...");
     } catch (e: any) {
       setMsg(e?.message || "Failed to create job");
@@ -51,16 +64,20 @@ export default function JobClient() {
 
   useEffect(() => {
     if (!jobId) return;
+    const id = jobId;
 
     let alive = true;
 
     async function tick() {
       try {
-        const res = await fetch(`/api/jobs/status?jobId=${encodeURIComponent(jobId)}`, {
+        const res = await fetch(`/api/clip/status?jobId=${encodeURIComponent(id)}`, {
           cache: "no-store",
         });
-        if (!res.ok) throw new Error(await res.text());
-        const data = (await res.json()) as Job;
+
+        const text = await res.text();
+        if (!res.ok) throw new Error(text || `Request failed (${res.status})`);
+
+        const data = JSON.parse(text) as Job;
 
         if (!alive) return;
         setJob(data);
@@ -92,18 +109,21 @@ export default function JobClient() {
 
   async function download(type: ArtifactType) {
     if (!jobId) return;
+
     setMsg(null);
     setDownloading(type);
 
     try {
-      const res = await fetch("/api/jobs/download", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jobId, type }),
-      });
+      const res = await fetch(
+        `/api/clip/artifact?jobId=${encodeURIComponent(jobId)}&type=${encodeURIComponent(type)}`,
+        { cache: "no-store" }
+      );
 
-      if (!res.ok) throw new Error(await res.text());
-      const data = (await res.json()) as { url: string };
+      const text = await res.text();
+      if (!res.ok) throw new Error(text || `Request failed (${res.status})`);
+
+      const data = JSON.parse(text) as { url: string };
+      if (!data?.url) throw new Error("No download URL returned");
 
       window.open(data.url, "_blank", "noopener,noreferrer");
     } catch (e: any) {
@@ -144,7 +164,7 @@ export default function JobClient() {
           </p>
 
           {job.status === "error" && job.error && (
-            <p className="mt-2 text-sm text-red-700">{job.error}</p>
+            <p className="mt-2 text-sm text-red-700 whitespace-pre-wrap">{job.error}</p>
           )}
 
           {job.status === "done" && (
@@ -177,7 +197,7 @@ export default function JobClient() {
         </div>
       )}
 
-      {msg && <p className="mt-3 text-sm opacity-80">{msg}</p>}
+      {msg && <p className="mt-3 text-sm opacity-80 whitespace-pre-wrap">{msg}</p>}
     </div>
   );
 }

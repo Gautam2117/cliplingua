@@ -1,0 +1,6 @@
+# ignore everything
+*
+
+# include the directory itself + everything inside it
+!web/
+!web/**

@@ -49,3 +49,5 @@ data/
 *.mp4
 *.wav
 *.log
+.vercel
+.env*.local

@@ -3,6 +3,7 @@ import sys
 import json
 import uuid
 import time
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
@@ -11,16 +12,21 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, FileResponse, Response
 from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
+from datetime import datetime, timezone
 
 load_dotenv()
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
-TMP_DIR = Path(os.getenv("TMP_DIR", "./tmp"))
+# Use /tmp defaults so it works on most hosts
+DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/cliplingua/data"))
+TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/cliplingua/tmp"))
+
+# Public base URL for this worker, used to generate artifact URLs
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="ClipLingua Worker", version="0.3.0")
+app = FastAPI(title="ClipLingua Worker", version="0.4.0")
 
 
 class CreateJobBody(BaseModel):
@@ -28,15 +34,21 @@ class CreateJobBody(BaseModel):
 
 
 def now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return datetime.now(timezone.utc).isoformat()
 
 
 def job_path(job_id: str) -> Path:
     return DATA_DIR / f"{job_id}.json"
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 def save_job(job_id: str, payload: Dict[str, Any]) -> None:
-    job_path(job_id).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_text(job_path(job_id), json.dumps(payload, indent=2))
 
 
 def load_job(job_id: str) -> Dict[str, Any]:
@@ -64,7 +76,7 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
-def wait_for_file(path: Path, min_bytes: int, tries: int = 140, sleep_s: float = 0.25) -> bool:
+def wait_for_file(path: Path, min_bytes: int, tries: int = 160, sleep_s: float = 0.25) -> bool:
     for _ in range(tries):
         try:
             if path.exists() and path.is_file() and path.stat().st_size >= min_bytes:
@@ -99,17 +111,30 @@ def safe_file_or_404(path_str: str, msg: str) -> Path:
     return p
 
 
+def require_bin(name: str) -> str:
+    p = shutil.which(name)
+    if not p:
+        raise RuntimeError(f"missing dependency: {name} not found in PATH")
+    return p
+
+
+def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
+    if not PUBLIC_BASE_URL:
+        return {"video_url": None, "audio_url": None, "log_url": None}
+    return {
+        "video_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/video",
+        "audio_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/audio",
+        "log_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/log",
+    }
+
+
 def process_job(job_id: str, url: str) -> None:
     tmp_job_dir = TMP_DIR / job_id
     tmp_job_dir.mkdir(parents=True, exist_ok=True)
 
     out_template = "download.%(ext)s"
-    merged_name = "download.mp4"
-    audio_name = "audio.wav"
-
-    merged_video = tmp_job_dir / merged_name
-    out_audio = tmp_job_dir / audio_name
     out_log = tmp_job_dir / "log.txt"
+    runner_log = tmp_job_dir / "runner.log"
 
     update_job(
         job_id,
@@ -117,24 +142,42 @@ def process_job(job_id: str, url: str) -> None:
             "status": "running",
             "updated_at": now_iso(),
             "updated_at_ts": time.time(),
+            "log_path": str(out_log.resolve()),
+            "runner_log_path": str(runner_log.resolve()),
         },
     )
 
     log_lines: List[str] = []
-
     try:
-        # 1) yt-dlp download + merge to mp4
+        yt_dlp_bin = require_bin("yt-dlp")
+        ffmpeg_bin = require_bin("ffmpeg")
+        ffmpeg_dir = str(Path(ffmpeg_bin).parent)
+
+        log_lines.append("== ENV ==")
+        log_lines.append(f"yt-dlp={yt_dlp_bin}")
+        log_lines.append(f"ffmpeg={ffmpeg_bin}")
+        log_lines.append(f"tmp_job_dir={tmp_job_dir}")
+
+        # Optional cookies file support if you need it for some videos
+        cookies = os.getenv("YTDLP_COOKIES_PATH", "").strip()
+        cookies_args: List[str] = []
+        if cookies:
+            cookies_args = ["--cookies", cookies]
+            log_lines.append(f"cookies={cookies}")
+
+        # 1) Download and merge
         dl_cmd = [
-            "yt-dlp",
-            "--js-runtimes",
-            "node",
+            yt_dlp_bin,
             "--no-playlist",
-            "-f",
-            "bv*+ba/b",
-            "--merge-output-format",
-            "mp4",
-            "-o",
-            out_template,
+            "--newline",
+            "--retries", "3",
+            "--fragment-retries", "3",
+            "--socket-timeout", "30",
+            "-f", "bv*+ba/b",
+            "--merge-output-format", "mp4",
+            "--ffmpeg-location", ffmpeg_dir,
+            "-o", out_template,
+            *cookies_args,
             str(url),
         ]
 
@@ -143,48 +186,49 @@ def process_job(job_id: str, url: str) -> None:
         log_lines.append(out)
 
         if rc != 0:
+            tail = "\n".join(out.splitlines()[-60:])
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
-            raise RuntimeError(f"download failed (rc={rc})")
+            raise RuntimeError(f"download failed (rc={rc})\n{tail}")
 
+        # Find merged mp4 robustly (do not assume exact name)
+        mp4s = sorted(tmp_job_dir.glob("download*.mp4"), key=lambda p: p.stat().st_size, reverse=True)
+        if not mp4s:
+            log_lines.append("== tmp dir listing ==")
+            log_lines.append(list_dir(tmp_job_dir))
+            raise RuntimeError("download produced no mp4")
+
+        merged_video = mp4s[0]
         if not wait_for_file(merged_video, min_bytes=1024 * 200):
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
-            raise RuntimeError("download produced no merged mp4")
+            raise RuntimeError("mp4 too small or not ready")
 
-        # 2) ffmpeg audio extraction (16k mono wav)
-        ff_cmd_rel = ["ffmpeg", "-y", "-i", merged_name, "-ac", "1", "-ar", "16000", audio_name]
-        rc2, out2 = run_cmd(ff_cmd_rel, cwd=tmp_job_dir)
+        # 2) Extract audio wav 16k mono
+        out_audio = tmp_job_dir / "audio.wav"
+        ff_cmd = [ffmpeg_bin, "-y", "-i", str(merged_video), "-ac", "1", "-ar", "16000", str(out_audio)]
+        rc2, out2 = run_cmd(ff_cmd, cwd=None)
         log_lines.append("== ffmpeg ==")
         log_lines.append(out2)
 
         if rc2 != 0:
-            ff_cmd_abs = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(merged_video.resolve()),
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                str(out_audio.resolve()),
-            ]
-            rc2b, out2b = run_cmd(ff_cmd_abs, cwd=None)
-            log_lines.append("== ffmpeg (fallback abs) ==")
-            log_lines.append(out2b)
-            rc2 = rc2b
-
-        if rc2 != 0 or not wait_for_file(out_audio, min_bytes=1024 * 10):
+            tail = "\n".join(out2.splitlines()[-80:])
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
-            raise RuntimeError("audio extraction failed")
+            raise RuntimeError(f"audio extraction failed (rc={rc2})\n{tail}")
+
+        if not wait_for_file(out_audio, min_bytes=1024 * 10):
+            log_lines.append("== tmp dir listing ==")
+            log_lines.append(list_dir(tmp_job_dir))
+            raise RuntimeError("audio wav not ready")
 
         log_lines.append("== DONE ==")
         log_lines.append(f"video={merged_video.resolve()}")
         log_lines.append(f"audio={out_audio.resolve()}")
 
         out_log.write_text("\n".join(log_lines), encoding="utf-8")
+
+        urls = _artifact_urls(job_id)
 
         update_job(
             job_id,
@@ -194,6 +238,7 @@ def process_job(job_id: str, url: str) -> None:
                 "video_path": str(merged_video.resolve()),
                 "audio_path": str(out_audio.resolve()),
                 "log_path": str(out_log.resolve()),
+                **urls,
                 "updated_at": now_iso(),
                 "updated_at_ts": time.time(),
             },
@@ -205,6 +250,8 @@ def process_job(job_id: str, url: str) -> None:
         except Exception:
             pass
 
+        urls = _artifact_urls(job_id)
+
         update_job(
             job_id,
             {
@@ -213,6 +260,7 @@ def process_job(job_id: str, url: str) -> None:
                 "video_path": None,
                 "audio_path": None,
                 "log_path": str(out_log.resolve()),
+                **urls,
                 "updated_at": now_iso(),
                 "updated_at_ts": time.time(),
             },
@@ -222,6 +270,20 @@ def process_job(job_id: str, url: str) -> None:
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/debug/binaries")
+def debug_binaries():
+    return {
+        "python": sys.version,
+        "yt_dlp": shutil.which("yt-dlp"),
+        "ffmpeg": shutil.which("ffmpeg"),
+        "ffprobe": shutil.which("ffprobe"),
+        "node": shutil.which("node"),
+        "DATA_DIR": str(DATA_DIR.resolve()),
+        "TMP_DIR": str(TMP_DIR.resolve()),
+        "PUBLIC_BASE_URL": PUBLIC_BASE_URL or None,
+    }
 
 
 @app.get("/routes")
@@ -239,23 +301,28 @@ def routes():
 @app.post("/jobs")
 def create_job(body: CreateJobBody):
     job_id = str(uuid.uuid4())
+    tmp_job_dir = TMP_DIR / job_id
+    tmp_job_dir.mkdir(parents=True, exist_ok=True)
 
-    payload = {
+    out_log = tmp_job_dir / "log.txt"
+    runner_log = tmp_job_dir / "runner.log"
+
+    payload: Dict[str, Any] = {
         "id": job_id,
         "url": str(body.url),
         "status": "queued",
         "error": None,
         "video_path": None,
         "audio_path": None,
-        "log_path": None,
+        "log_path": str(out_log.resolve()),
+        "runner_log_path": str(runner_log.resolve()),
+        **_artifact_urls(job_id),
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "updated_at_ts": time.time(),
     }
     save_job(job_id, payload)
 
-    # Safer than string interpolation into Python code:
-    # pass params via env and run a tiny inline runner.
     env = os.environ.copy()
     env["CLIPLINGUA_JOB_ID"] = job_id
     env["CLIPLINGUA_JOB_URL"] = str(body.url)
@@ -266,12 +333,15 @@ def create_job(body: CreateJobBody):
         "process_job(os.environ['CLIPLINGUA_JOB_ID'], os.environ['CLIPLINGUA_JOB_URL'])"
     )
 
+    log_f = open(runner_log, "a", encoding="utf-8")
+
     subprocess.Popen(
-        [sys.executable, "-c", runner],
+        [sys.executable, "-u", "-c", runner],
         cwd=str(Path(__file__).resolve().parents[1]),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_f,
+        stderr=log_f,
         env=env,
+        start_new_session=True,
     )
 
     return {"jobId": job_id}
@@ -286,10 +356,14 @@ def get_job(job_id: str):
 def get_job_log(job_id: str):
     job = load_job(job_id)
     lp = job.get("log_path")
-    if not lp:
-        raise HTTPException(status_code=404, detail="log not ready")
-    p = safe_file_or_404(lp, "log file missing")
-    return p.read_text(encoding="utf-8", errors="ignore")
+    if lp and Path(lp).exists():
+        return Path(lp).read_text(encoding="utf-8", errors="ignore")
+
+    rlp = job.get("runner_log_path")
+    if rlp and Path(rlp).exists():
+        return Path(rlp).read_text(encoding="utf-8", errors="ignore")
+
+    raise HTTPException(status_code=404, detail="log not ready")
 
 
 def _file_head_or_404(path_str: Optional[str]) -> Response:
