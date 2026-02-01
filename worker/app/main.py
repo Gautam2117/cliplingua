@@ -24,7 +24,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="ClipLingua Worker", version="0.6.1")
+app = FastAPI(title="ClipLingua Worker", version="0.6.2")
 
 
 class CreateJobBody(BaseModel):
@@ -116,16 +116,6 @@ def require_bin(name: str) -> str:
     return p
 
 
-def looks_like_bot_check(output: str) -> bool:
-    s = output.lower()
-    return (
-        "sign in to confirm" in s
-        or "not a bot" in s
-        or "--cookies-from-browser" in s
-        or "use --cookies" in s
-    )
-
-
 def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
     if not PUBLIC_BASE_URL:
         return {"video_url": None, "audio_url": None, "log_url": None}
@@ -141,7 +131,6 @@ def materialize_cookies(tmp_job_dir: Path, log_lines: List[str]) -> Optional[Pat
     if not b64:
         log_lines.append("cookies=none")
         return None
-
     try:
         cookies_path = tmp_job_dir / "cookies.txt"
         raw = base64.b64decode(b64.encode("utf-8"))
@@ -197,24 +186,32 @@ def process_job(job_id: str, url: str) -> None:
             yt_dlp_bin,
             "--no-playlist",
             "--newline",
-            "--retries", "3",
-            "--fragment-retries", "3",
+            "--retries", "5",
+            "--fragment-retries", "5",
             "--socket-timeout", "30",
             "--concurrent-fragments", "2",
             "--sleep-interval", "1",
             "--max-sleep-interval", "3",
-            "--extractor-args", "youtube:player_client=web,android",
+
+            # IMPORTANT: use only web client when using cookies
+            "--extractor-args", "youtube:player_client=web",
         ]
 
-        # Only add js runtime flag if this yt-dlp supports it
+        # Enable JS runtime if supported
         if yt_dlp_supports(yt_dlp_bin, "--js-runtimes"):
             dl_cmd += ["--js-runtimes", "node"]
             log_lines.append("js_runtime=enabled(--js-runtimes node)")
-        else:
-            log_lines.append("js_runtime=skipped(flag not supported)")
 
+        # IMPORTANT: enable EJS remote components so challenges can be solved
+        if yt_dlp_supports(yt_dlp_bin, "--remote-components"):
+            dl_cmd += ["--remote-components", "ejs:github"]
+            log_lines.append("remote_components=enabled(ejs:github)")
+
+        # More resilient format selection:
+        # Prefer mp4, else bestvideo+bestaudio, else best.
         dl_cmd += [
-            "-f", "bv*+ba/b",
+            "-S", "ext:mp4:m4a,codec:h264",
+            "-f", "bv*+ba/best",
             "--merge-output-format", "mp4",
             "-o", out_template,
             *cookies_args,
@@ -226,12 +223,7 @@ def process_job(job_id: str, url: str) -> None:
         log_lines.append(out)
 
         if rc != 0:
-            if looks_like_bot_check(out) and not cookies_file:
-                raise RuntimeError(
-                    "YouTube bot-check detected and cookies are missing.\n"
-                    "Set YTDLP_COOKIES_B64 and retry."
-                )
-            tail = "\n".join(out.splitlines()[-120:])
+            tail = "\n".join(out.splitlines()[-160:])
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError(f"download failed (rc={rc})\n{tail}")
@@ -255,7 +247,7 @@ def process_job(job_id: str, url: str) -> None:
         log_lines.append(out2)
 
         if rc2 != 0:
-            tail = "\n".join(out2.splitlines()[-120:])
+            tail = "\n".join(out2.splitlines()[-160:])
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError(f"audio extraction failed (rc={rc2})\n{tail}")
