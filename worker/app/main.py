@@ -24,7 +24,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="ClipLingua Worker", version="0.6.0")
+app = FastAPI(title="ClipLingua Worker", version="0.6.1")
 
 
 class CreateJobBody(BaseModel):
@@ -137,11 +137,6 @@ def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
 
 
 def materialize_cookies(tmp_job_dir: Path, log_lines: List[str]) -> Optional[Path]:
-    """
-    Render-friendly:
-    - Set YTDLP_COOKIES_B64 to base64(cookies.txt)
-    - Optionally set YTDLP_COOKIES_PATH (unused if b64 is provided)
-    """
     b64 = (os.getenv("YTDLP_COOKIES_B64") or "").strip()
     if not b64:
         log_lines.append("cookies=none")
@@ -157,6 +152,13 @@ def materialize_cookies(tmp_job_dir: Path, log_lines: List[str]) -> Optional[Pat
     except Exception as e:
         log_lines.append(f"cookies_error={e}")
         return None
+
+
+def yt_dlp_supports(yt_dlp_bin: str, flag: str) -> bool:
+    rc, out = run_cmd([yt_dlp_bin, "--help"], cwd=None)
+    if rc != 0:
+        return False
+    return flag in out
 
 
 def process_job(job_id: str, url: str) -> None:
@@ -182,12 +184,10 @@ def process_job(job_id: str, url: str) -> None:
     try:
         yt_dlp_bin = require_bin("yt-dlp")
         ffmpeg_bin = require_bin("ffmpeg")
-        node_bin = shutil.which("node")
 
         log_lines.append("== ENV ==")
         log_lines.append(f"yt-dlp={yt_dlp_bin}")
         log_lines.append(f"ffmpeg={ffmpeg_bin}")
-        log_lines.append(f"node={node_bin}")
         log_lines.append(f"tmp_job_dir={tmp_job_dir}")
 
         cookies_file = materialize_cookies(tmp_job_dir, log_lines)
@@ -206,8 +206,12 @@ def process_job(job_id: str, url: str) -> None:
             "--extractor-args", "youtube:player_client=web,android",
         ]
 
-        if node_bin:
+        # Only add js runtime flag if this yt-dlp supports it
+        if yt_dlp_supports(yt_dlp_bin, "--js-runtimes"):
             dl_cmd += ["--js-runtimes", "node"]
+            log_lines.append("js_runtime=enabled(--js-runtimes node)")
+        else:
+            log_lines.append("js_runtime=skipped(flag not supported)")
 
         dl_cmd += [
             "-f", "bv*+ba/b",
