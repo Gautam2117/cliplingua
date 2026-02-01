@@ -3,6 +3,7 @@ import sys
 import json
 import uuid
 import time
+import base64
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,17 +17,14 @@ from datetime import datetime, timezone
 
 load_dotenv()
 
-# Use /tmp defaults so it works on most hosts
 DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/cliplingua/data"))
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/cliplingua/tmp"))
-
-# Public base URL for this worker, used to generate artifact URLs
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="ClipLingua Worker", version="0.4.0")
+app = FastAPI(title="ClipLingua Worker", version="0.6.0")
 
 
 class CreateJobBody(BaseModel):
@@ -76,7 +74,7 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
-def wait_for_file(path: Path, min_bytes: int, tries: int = 160, sleep_s: float = 0.25) -> bool:
+def wait_for_file(path: Path, min_bytes: int, tries: int = 200, sleep_s: float = 0.25) -> bool:
     for _ in range(tries):
         try:
             if path.exists() and path.is_file() and path.stat().st_size >= min_bytes:
@@ -118,6 +116,16 @@ def require_bin(name: str) -> str:
     return p
 
 
+def looks_like_bot_check(output: str) -> bool:
+    s = output.lower()
+    return (
+        "sign in to confirm" in s
+        or "not a bot" in s
+        or "--cookies-from-browser" in s
+        or "use --cookies" in s
+    )
+
+
 def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
     if not PUBLIC_BASE_URL:
         return {"video_url": None, "audio_url": None, "log_url": None}
@@ -126,6 +134,29 @@ def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
         "audio_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/audio",
         "log_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/log",
     }
+
+
+def materialize_cookies(tmp_job_dir: Path, log_lines: List[str]) -> Optional[Path]:
+    """
+    Render-friendly:
+    - Set YTDLP_COOKIES_B64 to base64(cookies.txt)
+    - Optionally set YTDLP_COOKIES_PATH (unused if b64 is provided)
+    """
+    b64 = (os.getenv("YTDLP_COOKIES_B64") or "").strip()
+    if not b64:
+        log_lines.append("cookies=none")
+        return None
+
+    try:
+        cookies_path = tmp_job_dir / "cookies.txt"
+        raw = base64.b64decode(b64.encode("utf-8"))
+        cookies_path.write_bytes(raw)
+        os.chmod(cookies_path, 0o600)
+        log_lines.append("cookies=materialized")
+        return cookies_path
+    except Exception as e:
+        log_lines.append(f"cookies_error={e}")
+        return None
 
 
 def process_job(job_id: str, url: str) -> None:
@@ -151,31 +182,36 @@ def process_job(job_id: str, url: str) -> None:
     try:
         yt_dlp_bin = require_bin("yt-dlp")
         ffmpeg_bin = require_bin("ffmpeg")
-        ffmpeg_dir = str(Path(ffmpeg_bin).parent)
+        node_bin = shutil.which("node")
 
         log_lines.append("== ENV ==")
         log_lines.append(f"yt-dlp={yt_dlp_bin}")
         log_lines.append(f"ffmpeg={ffmpeg_bin}")
+        log_lines.append(f"node={node_bin}")
         log_lines.append(f"tmp_job_dir={tmp_job_dir}")
 
-        # Optional cookies file support if you need it for some videos
-        cookies = os.getenv("YTDLP_COOKIES_PATH", "").strip()
-        cookies_args: List[str] = []
-        if cookies:
-            cookies_args = ["--cookies", cookies]
-            log_lines.append(f"cookies={cookies}")
+        cookies_file = materialize_cookies(tmp_job_dir, log_lines)
+        cookies_args: List[str] = ["--cookies", str(cookies_file)] if cookies_file else []
 
-        # 1) Download and merge
-        dl_cmd = [
+        dl_cmd: List[str] = [
             yt_dlp_bin,
             "--no-playlist",
             "--newline",
             "--retries", "3",
             "--fragment-retries", "3",
             "--socket-timeout", "30",
+            "--concurrent-fragments", "2",
+            "--sleep-interval", "1",
+            "--max-sleep-interval", "3",
+            "--extractor-args", "youtube:player_client=web,android",
+        ]
+
+        if node_bin:
+            dl_cmd += ["--js-runtimes", "node"]
+
+        dl_cmd += [
             "-f", "bv*+ba/b",
             "--merge-output-format", "mp4",
-            "--ffmpeg-location", ffmpeg_dir,
             "-o", out_template,
             *cookies_args,
             str(url),
@@ -186,12 +222,16 @@ def process_job(job_id: str, url: str) -> None:
         log_lines.append(out)
 
         if rc != 0:
-            tail = "\n".join(out.splitlines()[-60:])
+            if looks_like_bot_check(out) and not cookies_file:
+                raise RuntimeError(
+                    "YouTube bot-check detected and cookies are missing.\n"
+                    "Set YTDLP_COOKIES_B64 and retry."
+                )
+            tail = "\n".join(out.splitlines()[-120:])
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError(f"download failed (rc={rc})\n{tail}")
 
-        # Find merged mp4 robustly (do not assume exact name)
         mp4s = sorted(tmp_job_dir.glob("download*.mp4"), key=lambda p: p.stat().st_size, reverse=True)
         if not mp4s:
             log_lines.append("== tmp dir listing ==")
@@ -204,7 +244,6 @@ def process_job(job_id: str, url: str) -> None:
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError("mp4 too small or not ready")
 
-        # 2) Extract audio wav 16k mono
         out_audio = tmp_job_dir / "audio.wav"
         ff_cmd = [ffmpeg_bin, "-y", "-i", str(merged_video), "-ac", "1", "-ar", "16000", str(out_audio)]
         rc2, out2 = run_cmd(ff_cmd, cwd=None)
@@ -212,7 +251,7 @@ def process_job(job_id: str, url: str) -> None:
         log_lines.append(out2)
 
         if rc2 != 0:
-            tail = "\n".join(out2.splitlines()[-80:])
+            tail = "\n".join(out2.splitlines()[-120:])
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError(f"audio extraction failed (rc={rc2})\n{tail}")
@@ -229,7 +268,6 @@ def process_job(job_id: str, url: str) -> None:
         out_log.write_text("\n".join(log_lines), encoding="utf-8")
 
         urls = _artifact_urls(job_id)
-
         update_job(
             job_id,
             {
@@ -251,7 +289,6 @@ def process_job(job_id: str, url: str) -> None:
             pass
 
         urls = _artifact_urls(job_id)
-
         update_job(
             job_id,
             {
@@ -278,24 +315,12 @@ def debug_binaries():
         "python": sys.version,
         "yt_dlp": shutil.which("yt-dlp"),
         "ffmpeg": shutil.which("ffmpeg"),
-        "ffprobe": shutil.which("ffprobe"),
         "node": shutil.which("node"),
         "DATA_DIR": str(DATA_DIR.resolve()),
         "TMP_DIR": str(TMP_DIR.resolve()),
         "PUBLIC_BASE_URL": PUBLIC_BASE_URL or None,
+        "has_cookies_b64": bool((os.getenv("YTDLP_COOKIES_B64") or "").strip()),
     }
-
-
-@app.get("/routes")
-def routes():
-    out = []
-    for r in app.router.routes:
-        methods = sorted(list(getattr(r, "methods", []) or []))
-        path = getattr(r, "path", "")
-        name = getattr(r, "name", "")
-        if path:
-            out.append({"path": path, "methods": methods, "name": name})
-    return {"routes": out}
 
 
 @app.post("/jobs")
