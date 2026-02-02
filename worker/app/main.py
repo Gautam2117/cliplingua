@@ -587,32 +587,35 @@ def _file_head_or_404(file_path: Optional[str]) -> Response:
 
 def _resolve_artifacts_and_patch(job_id: str, job: Dict[str, Any]) -> Dict[str, Any]:
     """
-    If job json is missing video_path/audio_path but files exist in TMP_DIR,
-    patch the job json so /video and /audio become consistent.
+    If job json is missing video_path/audio_path but files exist in JOB_STORE_DIR,
+    patch job json so /video and /audio become consistent.
     """
-    tmp_job_dir = _find_tmp_job_dir(job_id)
+    paths = _job_artifact_paths(job_id)
+    jd = paths["job_dir"]
 
     patch: Dict[str, Any] = {}
-    # Resolve video
-    vp = job.get("video_path")
-    if not vp or not Path(str(vp)).exists():
-        v = _pick_video_from_tmp(tmp_job_dir)
+
+    # Prefer JOB_STORE_DIR outputs
+    if (not job.get("video_path")) and paths["video"].exists():
+        patch["video_path"] = str(paths["video"].resolve())
+
+    if (not job.get("audio_path")) and paths["audio"].exists():
+        patch["audio_path"] = str(paths["audio"].resolve())
+
+    if (not job.get("log_path")) and paths["log"].exists():
+        patch["log_path"] = str(paths["log"].resolve())
+
+    # Optional fallback: TMP_DIR (only if still exists)
+    tmp_job_dir = TMP_DIR / job_id
+    if (not patch.get("video_path")) and (not job.get("video_path")):
+        v = _pick_video_from_tmp(tmp_job_dir) if tmp_job_dir.exists() else None
         if v:
             patch["video_path"] = str(v.resolve())
 
-    # Resolve audio
-    ap = job.get("audio_path")
-    if not ap or not Path(str(ap)).exists():
-        a = _pick_audio_from_tmp(tmp_job_dir)
+    if (not patch.get("audio_path")) and (not job.get("audio_path")):
+        a = _pick_audio_from_tmp(tmp_job_dir) if tmp_job_dir.exists() else None
         if a:
             patch["audio_path"] = str(a.resolve())
-
-    # Resolve log (optional)
-    lp = job.get("log_path")
-    if not lp or not Path(str(lp)).exists():
-        l = tmp_job_dir / "log.txt"
-        if l.exists() and l.is_file():
-            patch["log_path"] = str(l.resolve())
 
     if patch:
         patch["updated_at"] = now_iso()
@@ -621,9 +624,22 @@ def _resolve_artifacts_and_patch(job_id: str, job: Dict[str, Any]) -> Dict[str, 
 
     return job
 
+def load_job_for_artifacts(job_id: str) -> Dict[str, Any]:
+    """
+    For serving files, always prefer local job.json because it contains
+    video_path/audio_path and points to files in JOB_STORE_DIR.
+    Supabase row may not have those columns.
+    """
+    local = load_job_local(job_id)
+    if local:
+        return local
+
+    # fallback
+    return load_job(job_id)
+
 @app.get("/jobs/{job_id}/audio")
 def get_job_audio(job_id: str):
-    job = load_job(job_id)
+    job = load_job_for_artifacts(job_id)
     job = _resolve_artifacts_and_patch(job_id, job)
 
     ap = job.get("audio_path")
@@ -633,16 +649,17 @@ def get_job_audio(job_id: str):
     p = safe_file_or_404(ap, "audio file missing")
     return FileResponse(path=str(p), media_type="audio/wav", filename=f"{job_id}.wav")
 
+
 @app.head("/jobs/{job_id}/audio")
 def head_job_audio(job_id: str):
-    job = load_job(job_id)
+    job = load_job_for_artifacts(job_id)
     job = _resolve_artifacts_and_patch(job_id, job)
     return _file_head_or_404(job.get("audio_path"))
 
 
 @app.get("/jobs/{job_id}/video")
 def get_job_video(job_id: str):
-    job = load_job(job_id)
+    job = load_job_for_artifacts(job_id)
     job = _resolve_artifacts_and_patch(job_id, job)
 
     vp = job.get("video_path")
@@ -652,8 +669,9 @@ def get_job_video(job_id: str):
     p = safe_file_or_404(vp, "video file missing")
     return FileResponse(path=str(p), media_type="video/mp4", filename=f"{job_id}.mp4")
 
+
 @app.head("/jobs/{job_id}/video")
 def head_job_video(job_id: str):
-    job = load_job(job_id)
+    job = load_job_for_artifacts(job_id)
     job = _resolve_artifacts_and_patch(job_id, job)
     return _file_head_or_404(job.get("video_path"))
