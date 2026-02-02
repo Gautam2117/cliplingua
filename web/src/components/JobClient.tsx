@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { supabase } from "@/lib/supabase";
 
 type Job = {
   id: string;
@@ -24,7 +25,13 @@ type Job = {
 
 type ArtifactType = "video" | "audio" | "log";
 
-export default function JobClient() {
+export default function JobClient({
+  onJobCreated,
+  onCreditsChanged,
+}: {
+  onJobCreated?: () => void;
+  onCreditsChanged?: () => void;
+}) {
   const [ytUrl, setYtUrl] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [job, setJob] = useState<Job | null>(null);
@@ -41,9 +48,21 @@ export default function JobClient() {
     setJobId(null);
 
     try {
+      const { data: sess } = await supabase.auth.getSession();
+      const token = sess.session?.access_token;
+
+      if (!token) {
+        setMsg("Please sign in first.");
+        setBusy(false);
+        return;
+      }
+
       const res = await fetch("/api/clip/submit", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({ url: ytUrl.trim() }),
       });
 
@@ -56,6 +75,9 @@ export default function JobClient() {
 
       setJobId(id);
       setMsg("Job created. Processing...");
+
+      if (onJobCreated) onJobCreated();
+      if (onCreditsChanged) onCreditsChanged();
     } catch (e: any) {
       setMsg(e?.message || "Failed to create job");
       setBusy(false);
