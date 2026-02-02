@@ -17,12 +17,12 @@ from datetime import datetime, timezone
 
 load_dotenv()
 
-# NOTE:
-# - /tmp on Render is ephemeral and may be cleared on restarts.
-# - For production, set DATA_DIR to a persistent disk mount (Render Disk) such as /var/lib/cliplingua.
 DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/cliplingua/data"))
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/cliplingua/tmp"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
+SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,7 +30,17 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 JOB_STORE_DIR = DATA_DIR / "jobs"
 JOB_STORE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="ClipLingua Worker", version="0.6.3")
+# Optional Supabase client (service role, server-side only)
+_supabase = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    try:
+        from supabase import create_client
+        _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    except Exception:
+        _supabase = None
+
+
+app = FastAPI(title="ClipLingua Worker", version="0.6.4")
 
 
 class CreateJobBody(BaseModel):
@@ -42,7 +52,6 @@ def now_iso() -> str:
 
 
 def job_dir(job_id: str) -> Path:
-    # Keep all per-job state under one folder for predictable persistence.
     return JOB_STORE_DIR / job_id
 
 
@@ -57,10 +66,6 @@ def atomic_write_text(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
-def save_job(job_id: str, payload: Dict[str, Any]) -> None:
-    atomic_write_text(job_json_path(job_id), json.dumps(payload, indent=2))
-
-
 def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
     if not PUBLIC_BASE_URL:
         return {"video_url": None, "audio_url": None, "log_url": None}
@@ -71,31 +76,124 @@ def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
     }
 
 
-def load_job(job_id: str) -> Dict[str, Any]:
+def sb_upsert_job(job_id: str, payload: Dict[str, Any]) -> None:
+    if not _supabase:
+        return
+    try:
+        row = {
+            "id": job_id,
+            "url": payload.get("url"),
+            "status": payload.get("status", "queued"),
+            "error": payload.get("error"),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "video_url": payload.get("video_url"),
+            "audio_url": payload.get("audio_url"),
+            "log_url": payload.get("log_url"),
+        }
+        # Only set created_at on insert via default.
+        _supabase.table("clip_jobs").upsert(row).execute()
+    except Exception:
+        # Never fail the worker because Supabase hiccuped.
+        pass
+
+
+def sb_get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    if not _supabase:
+        return None
+    try:
+        res = _supabase.table("clip_jobs").select("*").eq("id", job_id).limit(1).execute()
+        data = getattr(res, "data", None)
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0]
+        return None
+    except Exception:
+        return None
+
+
+def sb_append_log(job_id: str, text: str) -> None:
+    if not _supabase:
+        return
+    try:
+        # Append by fetching current, then updating. Simple and reliable for now.
+        res = _supabase.table("clip_jobs").select("log_text").eq("id", job_id).limit(1).execute()
+        data = getattr(res, "data", None)
+        current = ""
+        if data and isinstance(data, list) and len(data) > 0:
+            current = data[0].get("log_text") or ""
+        updated = current + ("" if current.endswith("\n") or current == "" else "\n") + text
+        _supabase.table("clip_jobs").update(
+            {"log_text": updated, "updated_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", job_id).execute()
+    except Exception:
+        pass
+
+
+def sb_get_log(job_id: str) -> Optional[str]:
+    if not _supabase:
+        return None
+    try:
+        res = _supabase.table("clip_jobs").select("log_text").eq("id", job_id).limit(1).execute()
+        data = getattr(res, "data", None)
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0].get("log_text") or ""
+        return None
+    except Exception:
+        return None
+
+
+def save_job_local(job_id: str, payload: Dict[str, Any]) -> None:
+    atomic_write_text(job_json_path(job_id), json.dumps(payload, indent=2))
+
+
+def load_job_local(job_id: str) -> Optional[Dict[str, Any]]:
     p = job_json_path(job_id)
     if p.exists():
         return json.loads(p.read_text(encoding="utf-8"))
 
-    # Backward compat: older builds stored jobs as DATA_DIR/<job_id>.json
+    # Backward compat
     legacy = DATA_DIR / f"{job_id}.json"
     if legacy.exists():
         job = json.loads(legacy.read_text(encoding="utf-8"))
-        # Migrate into the new folder layout so future requests are consistent.
         jd = job_dir(job_id)
         jd.mkdir(parents=True, exist_ok=True)
         job.setdefault("id", job_id)
         job.update(_artifact_urls(job_id))
-        save_job(job_id, job)
+        save_job_local(job_id, job)
         return job
+
+    return None
+
+
+def load_job(job_id: str) -> Dict[str, Any]:
+    # Supabase first for persistence
+    sb = sb_get_job(job_id)
+    if sb:
+        # Return shape similar to local JSON
+        return {
+            "id": str(sb.get("id")),
+            "url": sb.get("url"),
+            "status": sb.get("status"),
+            "error": sb.get("error"),
+            "video_url": sb.get("video_url"),
+            "audio_url": sb.get("audio_url"),
+            "log_url": sb.get("log_url"),
+            "created_at": sb.get("created_at"),
+            "updated_at": sb.get("updated_at"),
+        }
+
+    local = load_job_local(job_id)
+    if local:
+        return local
 
     raise HTTPException(status_code=404, detail="job not found")
 
 
 def update_job(job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
-    job = load_job(job_id)
-    job.update(patch)
-    save_job(job_id, job)
-    return job
+    local = load_job_local(job_id) or {"id": job_id}
+    local.update(patch)
+    save_job_local(job_id, local)
+    sb_upsert_job(job_id, local)
+    return local
 
 
 def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
@@ -234,16 +332,13 @@ def process_job(job_id: str, url: str) -> None:
             "--concurrent-fragments", "2",
             "--sleep-interval", "1",
             "--max-sleep-interval", "3",
-            # IMPORTANT: use only web client when using cookies
             "--extractor-args", "youtube:player_client=web",
         ]
 
-        # Enable JS runtime if supported (avoid crashing on older yt-dlp builds)
         if yt_dlp_supports(yt_dlp_bin, "--js-runtimes"):
             dl_cmd += ["--js-runtimes", "node"]
             log_lines.append("js_runtime=enabled(--js-runtimes node)")
 
-        # Enable EJS remote components if supported
         if yt_dlp_supports(yt_dlp_bin, "--remote-components"):
             dl_cmd += ["--remote-components", "ejs:github"]
             log_lines.append("remote_components=enabled(ejs:github)")
@@ -260,23 +355,25 @@ def process_job(job_id: str, url: str) -> None:
         rc, out = run_cmd(dl_cmd, cwd=tmp_job_dir)
         log_lines.append("== yt-dlp ==")
         log_lines.append(out)
+        sb_append_log(job_id, "\n".join(log_lines[-60:]) + "\n")
 
         if rc != 0:
             tail = "\n".join(out.splitlines()[-160:])
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
+            sb_append_log(job_id, "\nERROR: download failed\n" + tail + "\n")
             raise RuntimeError(f"download failed (rc={rc})\n{tail}")
 
         mp4s = sorted(tmp_job_dir.glob("download*.mp4"), key=lambda p: p.stat().st_size, reverse=True)
         if not mp4s:
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
+            sb_append_log(job_id, "\nERROR: no mp4 produced\n")
             raise RuntimeError("download produced no mp4")
 
         merged_video = mp4s[0]
         if not wait_for_file(merged_video, min_bytes=1024 * 200):
-            log_lines.append("== tmp dir listing ==")
-            log_lines.append(list_dir(tmp_job_dir))
+            sb_append_log(job_id, "\nERROR: mp4 too small/not ready\n")
             raise RuntimeError("mp4 too small or not ready")
 
         tmp_audio = tmp_job_dir / "audio.wav"
@@ -284,19 +381,18 @@ def process_job(job_id: str, url: str) -> None:
         rc2, out2 = run_cmd(ff_cmd, cwd=None)
         log_lines.append("== ffmpeg ==")
         log_lines.append(out2)
+        sb_append_log(job_id, "\n".join(log_lines[-60:]) + "\n")
 
         if rc2 != 0:
             tail = "\n".join(out2.splitlines()[-160:])
-            log_lines.append("== tmp dir listing ==")
-            log_lines.append(list_dir(tmp_job_dir))
+            sb_append_log(job_id, "\nERROR: audio extraction failed\n" + tail + "\n")
             raise RuntimeError(f"audio extraction failed (rc={rc2})\n{tail}")
 
         if not wait_for_file(tmp_audio, min_bytes=1024 * 10):
-            log_lines.append("== tmp dir listing ==")
-            log_lines.append(list_dir(tmp_job_dir))
+            sb_append_log(job_id, "\nERROR: wav not ready\n")
             raise RuntimeError("audio wav not ready")
 
-        # Move finalized artifacts into DATA_DIR so GETs stay consistent across restarts.
+        # Move finalized artifacts to job dir (ephemeral on Render, but consistent within uptime).
         paths["video"].parent.mkdir(parents=True, exist_ok=True)
         merged_video.replace(paths["video"])
         tmp_audio.replace(paths["audio"])
@@ -306,6 +402,7 @@ def process_job(job_id: str, url: str) -> None:
         log_lines.append(f"audio={paths['audio'].resolve()}")
 
         out_log.write_text("\n".join(log_lines), encoding="utf-8")
+        sb_append_log(job_id, "\n== DONE ==\n")
 
         urls = _artifact_urls(job_id)
         update_job(
@@ -328,6 +425,8 @@ def process_job(job_id: str, url: str) -> None:
         except Exception:
             pass
 
+        sb_append_log(job_id, f"\nERROR: {e}\n")
+
         urls = _artifact_urls(job_id)
         update_job(
             job_id,
@@ -343,7 +442,6 @@ def process_job(job_id: str, url: str) -> None:
             },
         )
     finally:
-        # Best-effort cleanup of temp workspace; keep job_dir artifacts.
         try:
             shutil.rmtree(tmp_job_dir, ignore_errors=True)
         except Exception:
@@ -367,7 +465,7 @@ def debug_binaries():
         "JOB_STORE_DIR": str(JOB_STORE_DIR.resolve()),
         "PUBLIC_BASE_URL": PUBLIC_BASE_URL or None,
         "has_cookies_b64": bool((os.getenv("YTDLP_COOKIES_B64") or "").strip()),
-        "data_dir_is_tmp": str(DATA_DIR).startswith("/tmp/"),
+        "supabase_enabled": bool(_supabase),
     }
 
 
@@ -393,7 +491,8 @@ def create_job(body: CreateJobBody):
         "updated_at_ts": time.time(),
         "data_dir": str(paths["job_dir"].resolve()),
     }
-    save_job(job_id, payload)
+    save_job_local(job_id, payload)
+    sb_upsert_job(job_id, payload)
 
     env = os.environ.copy()
     env["CLIPLINGUA_JOB_ID"] = job_id
@@ -401,7 +500,7 @@ def create_job(body: CreateJobBody):
 
     runner = (
         "import os;"
-        "from app.main import process_job;"
+        "from worker.app.main import process_job;"
         "process_job(os.environ['CLIPLINGUA_JOB_ID'], os.environ['CLIPLINGUA_JOB_URL'])"
     )
 
@@ -409,7 +508,7 @@ def create_job(body: CreateJobBody):
 
     subprocess.Popen(
         [sys.executable, "-u", "-c", runner],
-        cwd=str(Path(__file__).resolve().parents[1]),
+        cwd=str(Path(__file__).resolve().parents[2]),
         stdout=log_f,
         stderr=log_f,
         env=env,
@@ -424,18 +523,14 @@ def get_job(job_id: str):
     return load_job(job_id)
 
 
-def _file_head_or_404(path_str: Optional[str]) -> Response:
-    if not path_str:
-        return Response(status_code=404)
-    p = Path(path_str)
-    if not p.exists() or not p.is_file():
-        return Response(status_code=404)
-    return Response(status_code=200)
-
-
 @app.get("/jobs/{job_id}/log", response_class=PlainTextResponse)
 def get_job_log(job_id: str):
-    # Read logs directly from the job folder first (works even if job.json is stale).
+    # Supabase first (persistent)
+    sb = sb_get_log(job_id)
+    if sb is not None and sb != "":
+        return sb
+
+    # Local fallback
     jd = job_dir(job_id)
     lp = jd / "log.txt"
     if lp.exists():
@@ -444,27 +539,7 @@ def get_job_log(job_id: str):
     if rlp.exists():
         return rlp.read_text(encoding="utf-8", errors="ignore")
 
-    # Fallback: old layout or temp logs
-    tmp_job_dir = TMP_DIR / job_id
-    lp2 = tmp_job_dir / "log.txt"
-    if lp2.exists():
-        return lp2.read_text(encoding="utf-8", errors="ignore")
-    rlp2 = tmp_job_dir / "runner.log"
-    if rlp2.exists():
-        return rlp2.read_text(encoding="utf-8", errors="ignore")
-
     raise HTTPException(status_code=404, detail="log not ready")
-
-
-@app.head("/jobs/{job_id}/log")
-def head_job_log(job_id: str):
-    jd = job_dir(job_id)
-    if (jd / "log.txt").exists() or (jd / "runner.log").exists():
-        return Response(status_code=200)
-    tmp_job_dir = TMP_DIR / job_id
-    if (tmp_job_dir / "log.txt").exists() or (tmp_job_dir / "runner.log").exists():
-        return Response(status_code=200)
-    return Response(status_code=404)
 
 
 @app.get("/jobs/{job_id}/audio")
@@ -477,12 +552,6 @@ def get_job_audio(job_id: str):
     return FileResponse(path=str(p), media_type="audio/wav", filename=f"{job_id}.wav")
 
 
-@app.head("/jobs/{job_id}/audio")
-def head_job_audio(job_id: str):
-    job = load_job(job_id)
-    return _file_head_or_404(job.get("audio_path"))
-
-
 @app.get("/jobs/{job_id}/video")
 def get_job_video(job_id: str):
     job = load_job(job_id)
@@ -491,9 +560,3 @@ def get_job_video(job_id: str):
         raise HTTPException(status_code=404, detail="video not ready")
     p = safe_file_or_404(vp, "video file missing")
     return FileResponse(path=str(p), media_type="video/mp4", filename=f"{job_id}.mp4")
-
-
-@app.head("/jobs/{job_id}/video")
-def head_job_video(job_id: str):
-    job = load_job(job_id)
-    return _file_head_or_404(job.get("video_path"))
