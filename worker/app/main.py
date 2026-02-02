@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 
 load_dotenv()
 
+# NOTE:
+# - /tmp on Render is ephemeral and may be cleared on restarts.
+# - For production, set DATA_DIR to a persistent disk mount (Render Disk) such as /var/lib/cliplingua.
 DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/cliplingua/data"))
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/cliplingua/tmp"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
@@ -24,7 +27,10 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="ClipLingua Worker", version="0.6.2")
+JOB_STORE_DIR = DATA_DIR / "jobs"
+JOB_STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="ClipLingua Worker", version="0.6.3")
 
 
 class CreateJobBody(BaseModel):
@@ -35,25 +41,54 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def job_path(job_id: str) -> Path:
-    return DATA_DIR / f"{job_id}.json"
+def job_dir(job_id: str) -> Path:
+    # Keep all per-job state under one folder for predictable persistence.
+    return JOB_STORE_DIR / job_id
+
+
+def job_json_path(job_id: str) -> Path:
+    return job_dir(job_id) / "job.json"
 
 
 def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
 
 
 def save_job(job_id: str, payload: Dict[str, Any]) -> None:
-    atomic_write_text(job_path(job_id), json.dumps(payload, indent=2))
+    atomic_write_text(job_json_path(job_id), json.dumps(payload, indent=2))
+
+
+def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
+    if not PUBLIC_BASE_URL:
+        return {"video_url": None, "audio_url": None, "log_url": None}
+    return {
+        "video_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/video",
+        "audio_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/audio",
+        "log_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/log",
+    }
 
 
 def load_job(job_id: str) -> Dict[str, Any]:
-    p = job_path(job_id)
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="job not found")
-    return json.loads(p.read_text(encoding="utf-8"))
+    p = job_json_path(job_id)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+
+    # Backward compat: older builds stored jobs as DATA_DIR/<job_id>.json
+    legacy = DATA_DIR / f"{job_id}.json"
+    if legacy.exists():
+        job = json.loads(legacy.read_text(encoding="utf-8"))
+        # Migrate into the new folder layout so future requests are consistent.
+        jd = job_dir(job_id)
+        jd.mkdir(parents=True, exist_ok=True)
+        job.setdefault("id", job_id)
+        job.update(_artifact_urls(job_id))
+        save_job(job_id, job)
+        return job
+
+    raise HTTPException(status_code=404, detail="job not found")
 
 
 def update_job(job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -116,16 +151,6 @@ def require_bin(name: str) -> str:
     return p
 
 
-def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
-    if not PUBLIC_BASE_URL:
-        return {"video_url": None, "audio_url": None, "log_url": None}
-    return {
-        "video_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/video",
-        "audio_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/audio",
-        "log_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/log",
-    }
-
-
 def materialize_cookies(tmp_job_dir: Path, log_lines: List[str]) -> Optional[Path]:
     b64 = (os.getenv("YTDLP_COOKIES_B64") or "").strip()
     if not b64:
@@ -150,13 +175,27 @@ def yt_dlp_supports(yt_dlp_bin: str, flag: str) -> bool:
     return flag in out
 
 
+def _job_artifact_paths(job_id: str) -> Dict[str, Path]:
+    jd = job_dir(job_id)
+    return {
+        "job_dir": jd,
+        "video": jd / "video.mp4",
+        "audio": jd / "audio.wav",
+        "log": jd / "log.txt",
+        "runner_log": jd / "runner.log",
+    }
+
+
 def process_job(job_id: str, url: str) -> None:
     tmp_job_dir = TMP_DIR / job_id
     tmp_job_dir.mkdir(parents=True, exist_ok=True)
 
+    paths = _job_artifact_paths(job_id)
+    paths["job_dir"].mkdir(parents=True, exist_ok=True)
+
     out_template = "download.%(ext)s"
-    out_log = tmp_job_dir / "log.txt"
-    runner_log = tmp_job_dir / "runner.log"
+    out_log = paths["log"]
+    runner_log = paths["runner_log"]
 
     update_job(
         job_id,
@@ -177,6 +216,9 @@ def process_job(job_id: str, url: str) -> None:
         log_lines.append("== ENV ==")
         log_lines.append(f"yt-dlp={yt_dlp_bin}")
         log_lines.append(f"ffmpeg={ffmpeg_bin}")
+        log_lines.append(f"DATA_DIR={DATA_DIR}")
+        log_lines.append(f"TMP_DIR={TMP_DIR}")
+        log_lines.append(f"job_dir={paths['job_dir']}")
         log_lines.append(f"tmp_job_dir={tmp_job_dir}")
 
         cookies_file = materialize_cookies(tmp_job_dir, log_lines)
@@ -192,23 +234,20 @@ def process_job(job_id: str, url: str) -> None:
             "--concurrent-fragments", "2",
             "--sleep-interval", "1",
             "--max-sleep-interval", "3",
-
             # IMPORTANT: use only web client when using cookies
             "--extractor-args", "youtube:player_client=web",
         ]
 
-        # Enable JS runtime if supported
+        # Enable JS runtime if supported (avoid crashing on older yt-dlp builds)
         if yt_dlp_supports(yt_dlp_bin, "--js-runtimes"):
             dl_cmd += ["--js-runtimes", "node"]
             log_lines.append("js_runtime=enabled(--js-runtimes node)")
 
-        # IMPORTANT: enable EJS remote components so challenges can be solved
+        # Enable EJS remote components if supported
         if yt_dlp_supports(yt_dlp_bin, "--remote-components"):
             dl_cmd += ["--remote-components", "ejs:github"]
             log_lines.append("remote_components=enabled(ejs:github)")
 
-        # More resilient format selection:
-        # Prefer mp4, else bestvideo+bestaudio, else best.
         dl_cmd += [
             "-S", "ext:mp4:m4a,codec:h264",
             "-f", "bv*+ba/best",
@@ -240,8 +279,8 @@ def process_job(job_id: str, url: str) -> None:
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError("mp4 too small or not ready")
 
-        out_audio = tmp_job_dir / "audio.wav"
-        ff_cmd = [ffmpeg_bin, "-y", "-i", str(merged_video), "-ac", "1", "-ar", "16000", str(out_audio)]
+        tmp_audio = tmp_job_dir / "audio.wav"
+        ff_cmd = [ffmpeg_bin, "-y", "-i", str(merged_video), "-ac", "1", "-ar", "16000", str(tmp_audio)]
         rc2, out2 = run_cmd(ff_cmd, cwd=None)
         log_lines.append("== ffmpeg ==")
         log_lines.append(out2)
@@ -252,14 +291,19 @@ def process_job(job_id: str, url: str) -> None:
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError(f"audio extraction failed (rc={rc2})\n{tail}")
 
-        if not wait_for_file(out_audio, min_bytes=1024 * 10):
+        if not wait_for_file(tmp_audio, min_bytes=1024 * 10):
             log_lines.append("== tmp dir listing ==")
             log_lines.append(list_dir(tmp_job_dir))
             raise RuntimeError("audio wav not ready")
 
+        # Move finalized artifacts into DATA_DIR so GETs stay consistent across restarts.
+        paths["video"].parent.mkdir(parents=True, exist_ok=True)
+        merged_video.replace(paths["video"])
+        tmp_audio.replace(paths["audio"])
+
         log_lines.append("== DONE ==")
-        log_lines.append(f"video={merged_video.resolve()}")
-        log_lines.append(f"audio={out_audio.resolve()}")
+        log_lines.append(f"video={paths['video'].resolve()}")
+        log_lines.append(f"audio={paths['audio'].resolve()}")
 
         out_log.write_text("\n".join(log_lines), encoding="utf-8")
 
@@ -269,8 +313,8 @@ def process_job(job_id: str, url: str) -> None:
             {
                 "status": "done",
                 "error": None,
-                "video_path": str(merged_video.resolve()),
-                "audio_path": str(out_audio.resolve()),
+                "video_path": str(paths["video"].resolve()),
+                "audio_path": str(paths["audio"].resolve()),
                 "log_path": str(out_log.resolve()),
                 **urls,
                 "updated_at": now_iso(),
@@ -298,6 +342,12 @@ def process_job(job_id: str, url: str) -> None:
                 "updated_at_ts": time.time(),
             },
         )
+    finally:
+        # Best-effort cleanup of temp workspace; keep job_dir artifacts.
+        try:
+            shutil.rmtree(tmp_job_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 @app.get("/health")
@@ -314,19 +364,19 @@ def debug_binaries():
         "node": shutil.which("node"),
         "DATA_DIR": str(DATA_DIR.resolve()),
         "TMP_DIR": str(TMP_DIR.resolve()),
+        "JOB_STORE_DIR": str(JOB_STORE_DIR.resolve()),
         "PUBLIC_BASE_URL": PUBLIC_BASE_URL or None,
         "has_cookies_b64": bool((os.getenv("YTDLP_COOKIES_B64") or "").strip()),
+        "data_dir_is_tmp": str(DATA_DIR).startswith("/tmp/"),
     }
 
 
 @app.post("/jobs")
 def create_job(body: CreateJobBody):
     job_id = str(uuid.uuid4())
-    tmp_job_dir = TMP_DIR / job_id
-    tmp_job_dir.mkdir(parents=True, exist_ok=True)
 
-    out_log = tmp_job_dir / "log.txt"
-    runner_log = tmp_job_dir / "runner.log"
+    paths = _job_artifact_paths(job_id)
+    paths["job_dir"].mkdir(parents=True, exist_ok=True)
 
     payload: Dict[str, Any] = {
         "id": job_id,
@@ -335,12 +385,13 @@ def create_job(body: CreateJobBody):
         "error": None,
         "video_path": None,
         "audio_path": None,
-        "log_path": str(out_log.resolve()),
-        "runner_log_path": str(runner_log.resolve()),
+        "log_path": str(paths["log"].resolve()),
+        "runner_log_path": str(paths["runner_log"].resolve()),
         **_artifact_urls(job_id),
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "updated_at_ts": time.time(),
+        "data_dir": str(paths["job_dir"].resolve()),
     }
     save_job(job_id, payload)
 
@@ -354,7 +405,7 @@ def create_job(body: CreateJobBody):
         "process_job(os.environ['CLIPLINGUA_JOB_ID'], os.environ['CLIPLINGUA_JOB_URL'])"
     )
 
-    log_f = open(runner_log, "a", encoding="utf-8")
+    log_f = open(paths["runner_log"], "a", encoding="utf-8")
 
     subprocess.Popen(
         [sys.executable, "-u", "-c", runner],
@@ -373,33 +424,6 @@ def get_job(job_id: str):
     return load_job(job_id)
 
 
-@app.get("/jobs/{job_id}/log", response_class=PlainTextResponse)
-def get_job_log(job_id: str):
-    # Normal path (job json exists)
-    try:
-        job = load_job(job_id)
-        lp = job.get("log_path")
-        if lp and Path(lp).exists():
-            return Path(lp).read_text(encoding="utf-8", errors="ignore")
-
-        rlp = job.get("runner_log_path")
-        if rlp and Path(rlp).exists():
-            return Path(rlp).read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        pass
-
-    # Fallback if job json is missing
-    tmp_job_dir = TMP_DIR / job_id
-    lp2 = tmp_job_dir / "log.txt"
-    if lp2.exists():
-        return lp2.read_text(encoding="utf-8", errors="ignore")
-
-    rlp2 = tmp_job_dir / "runner.log"
-    if rlp2.exists():
-        return rlp2.read_text(encoding="utf-8", errors="ignore")
-
-    raise HTTPException(status_code=404, detail="log not ready")
-
 def _file_head_or_404(path_str: Optional[str]) -> Response:
     if not path_str:
         return Response(status_code=404)
@@ -407,6 +431,40 @@ def _file_head_or_404(path_str: Optional[str]) -> Response:
     if not p.exists() or not p.is_file():
         return Response(status_code=404)
     return Response(status_code=200)
+
+
+@app.get("/jobs/{job_id}/log", response_class=PlainTextResponse)
+def get_job_log(job_id: str):
+    # Read logs directly from the job folder first (works even if job.json is stale).
+    jd = job_dir(job_id)
+    lp = jd / "log.txt"
+    if lp.exists():
+        return lp.read_text(encoding="utf-8", errors="ignore")
+    rlp = jd / "runner.log"
+    if rlp.exists():
+        return rlp.read_text(encoding="utf-8", errors="ignore")
+
+    # Fallback: old layout or temp logs
+    tmp_job_dir = TMP_DIR / job_id
+    lp2 = tmp_job_dir / "log.txt"
+    if lp2.exists():
+        return lp2.read_text(encoding="utf-8", errors="ignore")
+    rlp2 = tmp_job_dir / "runner.log"
+    if rlp2.exists():
+        return rlp2.read_text(encoding="utf-8", errors="ignore")
+
+    raise HTTPException(status_code=404, detail="log not ready")
+
+
+@app.head("/jobs/{job_id}/log")
+def head_job_log(job_id: str):
+    jd = job_dir(job_id)
+    if (jd / "log.txt").exists() or (jd / "runner.log").exists():
+        return Response(status_code=200)
+    tmp_job_dir = TMP_DIR / job_id
+    if (tmp_job_dir / "log.txt").exists() or (tmp_job_dir / "runner.log").exists():
+        return Response(status_code=200)
+    return Response(status_code=404)
 
 
 @app.get("/jobs/{job_id}/audio")
@@ -439,25 +497,3 @@ def get_job_video(job_id: str):
 def head_job_video(job_id: str):
     job = load_job(job_id)
     return _file_head_or_404(job.get("video_path"))
-
-@app.head("/jobs/{job_id}/log")
-def head_job_log(job_id: str):
-    # If job json exists and log exists
-    try:
-        job = load_job(job_id)
-        lp = job.get("log_path")
-        if lp and Path(lp).exists():
-            return Response(status_code=200)
-
-        rlp = job.get("runner_log_path")
-        if rlp and Path(rlp).exists():
-            return Response(status_code=200)
-    except Exception:
-        pass
-
-    # Fallback: if job json is missing, try common paths in TMP_DIR
-    tmp_job_dir = TMP_DIR / job_id
-    if (tmp_job_dir / "log.txt").exists() or (tmp_job_dir / "runner.log").exists():
-        return Response(status_code=200)
-
-    return Response(status_code=404)

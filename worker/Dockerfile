@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-ENV DATA_DIR=/tmp/cliplingua/data
+ENV DATA_DIR=/var/lib/cliplingua
 ENV TMP_DIR=/tmp/cliplingua/tmp
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
