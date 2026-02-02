@@ -7,6 +7,7 @@ function getWorkerBaseUrl() {
   const base =
     process.env.WORKER_BASE_URL?.trim() ||
     process.env.NEXT_PUBLIC_WORKER_BASE_URL?.trim() ||
+    process.env.WORKER_URL?.trim() ||
     "";
   if (!base) throw new Error("Missing WORKER_BASE_URL (or NEXT_PUBLIC_WORKER_BASE_URL)");
   return base.replace(/\/+$/, "");
@@ -18,12 +19,24 @@ function getBearer(req: Request) {
   return m?.[1]?.trim() || null;
 }
 
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 export async function POST(req: Request) {
   try {
     const token = getBearer(req);
-    if (!token) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
+    if (!token) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
     const body = await req.json();
     const url = String(body?.url || "").trim();
@@ -31,11 +44,8 @@ export async function POST(req: Request) {
 
     const sb = supabaseAuthed(token);
 
-    // Ensure token is valid and get user id
     const { data: u, error: uErr } = await sb.auth.getUser();
-    if (uErr || !u.user) {
-      return NextResponse.json({ error: "Invalid session" }, { status: 401 });
-    }
+    if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
     const COST = 1;
 
@@ -52,13 +62,16 @@ export async function POST(req: Request) {
     const workerBase = getWorkerBaseUrl();
 
     // Create job on worker
-    const r = await fetch(`${workerBase}/jobs`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ url }),
-      signal: AbortSignal.timeout(30_000),
-      cache: "no-store",
-    });
+    const r = await fetchWithTimeout(
+      `${workerBase}/jobs`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url }),
+        cache: "no-store",
+      },
+      30_000
+    );
 
     const text = await r.text();
     let worker: any = null;
@@ -79,7 +92,7 @@ export async function POST(req: Request) {
 
     const workerJobId = worker.jobId as string;
 
-    // Insert job record owned by user (RLS enforced)
+    // Insert job record (RLS enforced)
     const { error: insErr } = await sb.from("user_jobs").insert({
       user_id: u.user.id,
       youtube_url: url,
@@ -89,13 +102,13 @@ export async function POST(req: Request) {
     });
 
     if (insErr) {
-      // Refund if DB insert failed
       await sb.rpc("refund_credits", { amount: COST }).catch(() => null);
       return NextResponse.json({ error: insErr.message }, { status: 500 });
     }
 
     return NextResponse.json({ jobId: workerJobId });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message || "Submit failed" }, { status: 500 });
+    const msg = e?.name === "AbortError" ? "Worker timeout" : e?.message || "Submit failed";
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
