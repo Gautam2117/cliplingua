@@ -552,22 +552,108 @@ def get_job_log(job_id: str):
 
     raise HTTPException(status_code=404, detail="log not ready")
 
+def _find_tmp_job_dir(job_id: str) -> Path:
+    return TMP_DIR / job_id
+
+
+def _pick_video_from_tmp(tmp_job_dir: Path) -> Optional[Path]:
+    # Common outputs: download.mp4, download.<ext>, or merged mp4.
+    candidates = []
+    candidates += list(tmp_job_dir.glob("download*.mp4"))
+    candidates += list(tmp_job_dir.glob("*.mp4"))
+    candidates = [p for p in candidates if p.is_file()]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda p: p.stat().st_size, reverse=True)[0]
+
+
+def _pick_audio_from_tmp(tmp_job_dir: Path) -> Optional[Path]:
+    p = tmp_job_dir / "audio.wav"
+    if p.exists() and p.is_file():
+        return p
+    # fallback search
+    wavs = [x for x in tmp_job_dir.glob("*.wav") if x.is_file()]
+    if not wavs:
+        return None
+    return sorted(wavs, key=lambda p: p.stat().st_size, reverse=True)[0]
+
+
+def _file_head_or_404(file_path: Optional[str]) -> Response:
+    if not file_path:
+        raise HTTPException(status_code=404, detail="file not ready")
+    p = safe_file_or_404(file_path, "file missing")
+    return Response(headers={"Content-Length": str(p.stat().st_size)})
+
+
+def _resolve_artifacts_and_patch(job_id: str, job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    If job json is missing video_path/audio_path but files exist in TMP_DIR,
+    patch the job json so /video and /audio become consistent.
+    """
+    tmp_job_dir = _find_tmp_job_dir(job_id)
+
+    patch: Dict[str, Any] = {}
+    # Resolve video
+    vp = job.get("video_path")
+    if not vp or not Path(str(vp)).exists():
+        v = _pick_video_from_tmp(tmp_job_dir)
+        if v:
+            patch["video_path"] = str(v.resolve())
+
+    # Resolve audio
+    ap = job.get("audio_path")
+    if not ap or not Path(str(ap)).exists():
+        a = _pick_audio_from_tmp(tmp_job_dir)
+        if a:
+            patch["audio_path"] = str(a.resolve())
+
+    # Resolve log (optional)
+    lp = job.get("log_path")
+    if not lp or not Path(str(lp)).exists():
+        l = tmp_job_dir / "log.txt"
+        if l.exists() and l.is_file():
+            patch["log_path"] = str(l.resolve())
+
+    if patch:
+        patch["updated_at"] = now_iso()
+        patch["updated_at_ts"] = time.time()
+        job = update_job(job_id, patch)
+
+    return job
 
 @app.get("/jobs/{job_id}/audio")
 def get_job_audio(job_id: str):
     job = load_job(job_id)
+    job = _resolve_artifacts_and_patch(job_id, job)
+
     ap = job.get("audio_path")
     if not ap:
         raise HTTPException(status_code=404, detail="audio not ready")
+
     p = safe_file_or_404(ap, "audio file missing")
     return FileResponse(path=str(p), media_type="audio/wav", filename=f"{job_id}.wav")
+
+@app.head("/jobs/{job_id}/audio")
+def head_job_audio(job_id: str):
+    job = load_job(job_id)
+    job = _resolve_artifacts_and_patch(job_id, job)
+    return _file_head_or_404(job.get("audio_path"))
 
 
 @app.get("/jobs/{job_id}/video")
 def get_job_video(job_id: str):
     job = load_job(job_id)
+    job = _resolve_artifacts_and_patch(job_id, job)
+
     vp = job.get("video_path")
     if not vp:
         raise HTTPException(status_code=404, detail="video not ready")
+
     p = safe_file_or_404(vp, "video file missing")
     return FileResponse(path=str(p), media_type="video/mp4", filename=f"{job_id}.mp4")
+
+@app.head("/jobs/{job_id}/video")
+def head_job_video(job_id: str):
+    job = load_job(job_id)
+    job = _resolve_artifacts_and_patch(job_id, job)
+    return _file_head_or_404(job.get("video_path"))
