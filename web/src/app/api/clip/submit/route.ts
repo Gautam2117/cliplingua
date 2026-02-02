@@ -3,6 +3,10 @@ import { supabaseAuthed } from "@/lib/supabase-server";
 
 export const runtime = "nodejs";
 
+// Allow longer execution on Vercel (needed for cold-start worker)
+export const maxDuration = 120;
+export const dynamic = "force-dynamic";
+
 function getWorkerBaseUrl() {
   const base =
     process.env.WORKER_BASE_URL?.trim() ||
@@ -33,7 +37,18 @@ async function fetchWithTimeout(
   }
 }
 
+async function safeRefund(sb: ReturnType<typeof supabaseAuthed>, amount: number) {
+  try {
+    await sb.rpc("refund_credits", { amount });
+  } catch {
+    // ignore refund failure
+  }
+}
+
 export async function POST(req: Request) {
+  let reserved = false;
+  const COST = 1;
+
   try {
     const token = getBearer(req);
     if (!token) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -44,10 +59,9 @@ export async function POST(req: Request) {
 
     const sb = supabaseAuthed(token);
 
+    // Validate session
     const { data: u, error: uErr } = await sb.auth.getUser();
     if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
-
-    const COST = 1;
 
     // Reserve credits first (atomic)
     const { error: reserveErr } = await sb.rpc("reserve_credits", { amount: COST });
@@ -58,10 +72,18 @@ export async function POST(req: Request) {
           : reserveErr.message;
       return NextResponse.json({ error: msg }, { status: 402 });
     }
+    reserved = true;
 
     const workerBase = getWorkerBaseUrl();
 
-    // Create job on worker
+    // Warmup ping (helps Render cold start). Ignore failures.
+    try {
+      await fetchWithTimeout(`${workerBase}/health`, { cache: "no-store" }, 10_000);
+    } catch {
+      // ignore
+    }
+
+    // Create job on worker (longer timeout for cold start)
     const r = await fetchWithTimeout(
       `${workerBase}/jobs`,
       {
@@ -70,7 +92,7 @@ export async function POST(req: Request) {
         body: JSON.stringify({ url }),
         cache: "no-store",
       },
-      30_000
+      90_000
     );
 
     const text = await r.text();
@@ -82,13 +104,7 @@ export async function POST(req: Request) {
     }
 
     if (!r.ok || !worker?.jobId) {
-      // Refund if worker failed
-      try {
-        await sb.rpc("refund_credits", { amount: COST });
-      } catch {
-        // ignore refund failure
-      }
-
+      if (reserved) await safeRefund(sb, COST);
       return NextResponse.json(
         { error: "Worker create job failed", workerStatus: r.status, workerBody: worker },
         { status: 502 }
@@ -97,7 +113,7 @@ export async function POST(req: Request) {
 
     const workerJobId = worker.jobId as string;
 
-    // Insert job record (RLS enforced)
+    // Insert user-owned job (RLS enforced)
     const { error: insErr } = await sb.from("user_jobs").insert({
       user_id: u.user.id,
       youtube_url: url,
@@ -107,18 +123,14 @@ export async function POST(req: Request) {
     });
 
     if (insErr) {
-      try {
-        await sb.rpc("refund_credits", { amount: COST });
-      } catch {
-        // ignore refund failure
-      }
-
+      if (reserved) await safeRefund(sb, COST);
       return NextResponse.json({ error: insErr.message }, { status: 500 });
     }
 
     return NextResponse.json({ jobId: workerJobId });
   } catch (e: any) {
-    const msg = e?.name === "AbortError" ? "Worker timeout" : e?.message || "Submit failed";
+    const isAbort = e?.name === "AbortError";
+    const msg = isAbort ? "Worker timeout" : e?.message || "Submit failed";
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
