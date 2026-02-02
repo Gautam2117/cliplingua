@@ -24,11 +24,22 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
 SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-TMP_DIR.mkdir(parents=True, exist_ok=True)
+def ensure_writable_dir(p: Path, fallback: Path) -> Path:
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        test = p / ".write_test"
+        test.write_text("ok", encoding="utf-8")
+        test.unlink(missing_ok=True)
+        return p
+    except Exception:
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
-JOB_STORE_DIR = DATA_DIR / "jobs"
-JOB_STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+DATA_DIR = ensure_writable_dir(DATA_DIR, Path("/tmp/cliplingua/data"))
+TMP_DIR = ensure_writable_dir(TMP_DIR, Path("/tmp/cliplingua/tmp"))
+
+JOB_STORE_DIR = ensure_writable_dir(DATA_DIR / "jobs", DATA_DIR / "jobs")
 
 # Optional Supabase client (service role, server-side only)
 _supabase = None
