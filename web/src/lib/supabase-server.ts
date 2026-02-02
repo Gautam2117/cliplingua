@@ -24,3 +24,25 @@ export function supabaseAuthed(accessToken: string) {
     },
   });
 }
+
+/**
+ * Server-side client.
+ * Uses Service Role key if present (preferred for Storage upload/sign).
+ * Falls back to anon key if service key is missing (limited permissions).
+ */
+export function supabaseServer() {
+  const url = getSupabaseUrl();
+  if (!url) throw new Error("Missing SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)");
+
+  const service = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+  const anon = getAnonKey();
+
+  const key = service || anon;
+  if (!key) {
+    throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY and SUPABASE_ANON_KEY");
+  }
+
+  return createClient(url, key, {
+    auth: { persistSession: false },
+  });
+}
