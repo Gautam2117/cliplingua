@@ -83,7 +83,12 @@ export async function POST(req: Request) {
 
     if (!r.ok || !worker?.jobId) {
       // Refund if worker failed
-      await sb.rpc("refund_credits", { amount: COST }).catch(() => null);
+      try {
+        await sb.rpc("refund_credits", { amount: COST });
+      } catch {
+        // ignore refund failure
+      }
+
       return NextResponse.json(
         { error: "Worker create job failed", workerStatus: r.status, workerBody: worker },
         { status: 502 }
@@ -102,7 +107,12 @@ export async function POST(req: Request) {
     });
 
     if (insErr) {
-      await sb.rpc("refund_credits", { amount: COST }).catch(() => null);
+      try {
+        await sb.rpc("refund_credits", { amount: COST });
+      } catch {
+        // ignore refund failure
+      }
+
       return NextResponse.json({ error: insErr.message }, { status: 500 });
     }
 
