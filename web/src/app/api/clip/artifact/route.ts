@@ -6,6 +6,16 @@ const TYPE_MAP: Record<string, string> = {
   log: "log",
 };
 
+function getWorkerBaseUrl() {
+  const base =
+    process.env.WORKER_BASE_URL?.trim() ||
+    process.env.NEXT_PUBLIC_WORKER_BASE_URL?.trim() ||
+    process.env.WORKER_URL?.trim() ||
+    "";
+  if (!base) throw new Error("WORKER_BASE_URL not set");
+  return base.replace(/\/+$/, "");
+}
+
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
@@ -15,21 +25,21 @@ export async function GET(req: Request) {
     if (!jobId) return new NextResponse("Missing jobId", { status: 400 });
     if (!TYPE_MAP[type]) return new NextResponse("Invalid type", { status: 400 });
 
-    const workerBase =
-      process.env.WORKER_BASE_URL || process.env.NEXT_PUBLIC_WORKER_BASE_URL;
-    if (!workerBase) return new NextResponse("WORKER_BASE_URL not set", { status: 500 });
+    const workerBase = getWorkerBaseUrl();
 
-    const base = workerBase.replace(/\/$/, "");
-    const url = `${base}/jobs/${encodeURIComponent(jobId)}/${TYPE_MAP[type]}`;
+    // Check job status (do not use HEAD on artifact endpoints)
+    const jr = await fetch(`${workerBase}/jobs/${encodeURIComponent(jobId)}`, {
+      cache: "no-store",
+    });
 
-    // Readiness check:
-    // - video/audio: HEAD exists and is cheap
-    // - log: HEAD might not exist (405), so skip check or treat 405 as ok
-    if (type !== "log") {
-      const head = await fetch(url, { method: "HEAD", cache: "no-store" });
-      if (!head.ok) return new NextResponse("Artifact not ready", { status: 404 });
+    if (!jr.ok) return new NextResponse("Job not found", { status: jr.status });
+
+    const job = await jr.json();
+    if (job.status !== "done") {
+      return new NextResponse(`Job not done (status=${job.status})`, { status: 409 });
     }
 
+    const url = `${workerBase}/jobs/${encodeURIComponent(jobId)}/${TYPE_MAP[type]}`;
     return NextResponse.json({ url });
   } catch (e: any) {
     return new NextResponse(e?.message || "Artifact failed", { status: 500 });

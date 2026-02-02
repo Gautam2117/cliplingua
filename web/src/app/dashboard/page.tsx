@@ -68,6 +68,53 @@ export default function DashboardPage() {
     }
 
     setJobs((jobRows || []) as any);
+
+    // Best-effort: sync status from worker for recent jobs
+    try {
+    const workerBase =
+        process.env.NEXT_PUBLIC_WORKER_BASE_URL ||
+        process.env.NEXT_PUBLIC_WORKER_URL ||
+        "";
+
+    // If you don't have NEXT_PUBLIC_WORKER_BASE_URL set, skip syncing
+    if (workerBase) {
+        const base = workerBase.replace(/\/+$/, "");
+
+        const updates: { worker_job_id: string; status: string }[] = [];
+
+        for (const j of jobRows || []) {
+        const wid = (j as any).worker_job_id as string;
+        const r = await fetch(`${base}/jobs/${encodeURIComponent(wid)}`, { cache: "no-store" });
+        if (!r.ok) continue;
+        const wj = await r.json();
+        if (typeof wj?.status === "string" && wj.status !== (j as any).status) {
+            updates.push({ worker_job_id: wid, status: wj.status });
+        }
+        }
+
+        // Apply updates in DB (RLS ensures only your rows)
+        for (const u2 of updates) {
+        await supabase
+            .from("user_jobs")
+            .update({ status: u2.status })
+            .eq("worker_job_id", u2.worker_job_id);
+        }
+
+        // Re-fetch after update for correct UI
+        if (updates.length > 0) {
+        const { data: fresh } = await supabase
+            .from("user_jobs")
+            .select("id,youtube_url,worker_job_id,status,credits_spent,created_at")
+            .order("created_at", { ascending: false })
+            .limit(20);
+
+        if (fresh) setJobs(fresh as any);
+        }
+    }
+    } catch {
+    // ignore sync errors
+    }
+
   }
 
   useEffect(() => {
