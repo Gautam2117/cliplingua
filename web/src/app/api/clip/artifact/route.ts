@@ -15,15 +15,20 @@ export async function GET(req: Request) {
     if (!jobId) return new NextResponse("Missing jobId", { status: 400 });
     if (!TYPE_MAP[type]) return new NextResponse("Invalid type", { status: 400 });
 
-    const workerBase = process.env.WORKER_BASE_URL || process.env.NEXT_PUBLIC_WORKER_BASE_URL;
+    const workerBase =
+      process.env.WORKER_BASE_URL || process.env.NEXT_PUBLIC_WORKER_BASE_URL;
     if (!workerBase) return new NextResponse("WORKER_BASE_URL not set", { status: 500 });
 
     const base = workerBase.replace(/\/$/, "");
     const url = `${base}/jobs/${encodeURIComponent(jobId)}/${TYPE_MAP[type]}`;
 
-    // Optional readiness check
-    const head = await fetch(url, { method: "HEAD", cache: "no-store" });
-    if (!head.ok) return new NextResponse("Artifact not ready", { status: 404 });
+    // Readiness check:
+    // - video/audio: HEAD exists and is cheap
+    // - log: HEAD might not exist (405), so skip check or treat 405 as ok
+    if (type !== "log") {
+      const head = await fetch(url, { method: "HEAD", cache: "no-store" });
+      if (!head.ok) return new NextResponse("Artifact not ready", { status: 404 });
+    }
 
     return NextResponse.json({ url });
   } catch (e: any) {

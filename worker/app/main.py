@@ -375,17 +375,30 @@ def get_job(job_id: str):
 
 @app.get("/jobs/{job_id}/log", response_class=PlainTextResponse)
 def get_job_log(job_id: str):
-    job = load_job(job_id)
-    lp = job.get("log_path")
-    if lp and Path(lp).exists():
-        return Path(lp).read_text(encoding="utf-8", errors="ignore")
+    # Normal path (job json exists)
+    try:
+        job = load_job(job_id)
+        lp = job.get("log_path")
+        if lp and Path(lp).exists():
+            return Path(lp).read_text(encoding="utf-8", errors="ignore")
 
-    rlp = job.get("runner_log_path")
-    if rlp and Path(rlp).exists():
-        return Path(rlp).read_text(encoding="utf-8", errors="ignore")
+        rlp = job.get("runner_log_path")
+        if rlp and Path(rlp).exists():
+            return Path(rlp).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        pass
+
+    # Fallback if job json is missing
+    tmp_job_dir = TMP_DIR / job_id
+    lp2 = tmp_job_dir / "log.txt"
+    if lp2.exists():
+        return lp2.read_text(encoding="utf-8", errors="ignore")
+
+    rlp2 = tmp_job_dir / "runner.log"
+    if rlp2.exists():
+        return rlp2.read_text(encoding="utf-8", errors="ignore")
 
     raise HTTPException(status_code=404, detail="log not ready")
-
 
 def _file_head_or_404(path_str: Optional[str]) -> Response:
     if not path_str:
@@ -426,3 +439,25 @@ def get_job_video(job_id: str):
 def head_job_video(job_id: str):
     job = load_job(job_id)
     return _file_head_or_404(job.get("video_path"))
+
+@app.head("/jobs/{job_id}/log")
+def head_job_log(job_id: str):
+    # If job json exists and log exists
+    try:
+        job = load_job(job_id)
+        lp = job.get("log_path")
+        if lp and Path(lp).exists():
+            return Response(status_code=200)
+
+        rlp = job.get("runner_log_path")
+        if rlp and Path(rlp).exists():
+            return Response(status_code=200)
+    except Exception:
+        pass
+
+    # Fallback: if job json is missing, try common paths in TMP_DIR
+    tmp_job_dir = TMP_DIR / job_id
+    if (tmp_job_dir / "log.txt").exists() or (tmp_job_dir / "runner.log").exists():
+        return Response(status_code=200)
+
+    return Response(status_code=404)
