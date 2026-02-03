@@ -319,6 +319,20 @@ def _job_artifact_paths(job_id: str) -> Dict[str, Path]:
         "runner_log": jd / "runner.log",
     }
 
+def dub_status_path(job_id: str, lang: str) -> Path:
+    return dub_dir(job_id, lang) / "status.json"
+
+def write_dub_status(job_id: str, lang: str, status: str, error: str | None = None) -> None:
+    p = dub_status_path(job_id, lang)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(p, json.dumps({
+        "job_id": job_id,
+        "lang": lang,
+        "status": status,   # queued | running | done | error
+        "error": error,
+        "updated_at": now_iso(),
+    }, indent=2))
+
 SUPPORTED_DUB_LANGS = {"hi", "en", "es"}
 
 def dub_dir(job_id: str, lang: str) -> Path:
@@ -572,6 +586,13 @@ def mux_audio_into_video(ffmpeg_bin: str, video_in: Path, audio_in: Path, video_
 def health():
     return {"ok": True}
 
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return "ClipLingua Worker OK"
+
+@app.head("/")
+def head_root():
+    return Response(status_code=200)
 
 @app.get("/debug/binaries")
 def debug_binaries():
@@ -788,61 +809,140 @@ def head_job_video(job_id: str):
 class DubBody(BaseModel):
     lang: str  # "hi" | "en" | "es"
 
+def process_dub(job_id: str, lang: str) -> None:
+    lang = (lang or "").strip().lower()
+    if lang not in SUPPORTED_DUB_LANGS:
+        write_dub_status(job_id, lang, "error", "unsupported lang")
+        return
+
+    dd = dub_dir(job_id, lang)
+    dd.mkdir(parents=True, exist_ok=True)
+    log_path = dd / "log.txt"
+
+    def log(line: str):
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line.rstrip() + "\n")
+
+    try:
+        write_dub_status(job_id, lang, "running")
+        log("== DUB START ==")
+
+        job = load_job_for_artifacts(job_id)
+        job = _resolve_artifacts_and_patch(job_id, job)
+
+        if job.get("status") != "done":
+            raise RuntimeError(f"base job not done (status={job.get('status')})")
+
+        video_in = safe_file_or_404(job.get("video_path"), "video missing")
+        audio_in = safe_file_or_404(job.get("audio_path"), "audio missing")
+
+        out_audio = dub_audio_path(job_id, lang)
+        out_video = dub_video_path(job_id, lang)
+
+        if out_audio.exists() and out_video.exists():
+            log("cached=true (already exists)")
+            write_dub_status(job_id, lang, "done")
+            return
+
+        ffmpeg_bin = require_bin("ffmpeg")
+
+        log("loading models (first time can be slow)")
+        tr = whisper_transcribe(audio_in)
+        src_text = tr.get("text", "")
+        log(f"transcribed_chars={len(src_text)}")
+
+        if lang == "en":
+            translated = src_text
+        else:
+            translated = nllb_translate(src_text, lang)
+
+        if not translated.strip():
+            raise RuntimeError("translation empty")
+
+        log(f"translated_chars={len(translated)}")
+
+        xtts_speak(translated, lang, out_audio)
+        if not out_audio.exists() or out_audio.stat().st_size < 2048:
+            raise RuntimeError("dub audio not generated")
+
+        mux_audio_into_video(ffmpeg_bin, video_in, out_audio, out_video)
+        if not out_video.exists() or out_video.stat().st_size < 10_000:
+            raise RuntimeError("dub video not generated")
+
+        log("== DUB DONE ==")
+        write_dub_status(job_id, lang, "done")
+
+    except Exception as e:
+        log(f"ERROR: {e}")
+        write_dub_status(job_id, lang, "error", str(e))
+
+
 @app.post("/jobs/{job_id}/dub")
 def dub_job(job_id: str, body: DubBody):
     lang = (body.lang or "").strip().lower()
     if lang not in SUPPORTED_DUB_LANGS:
         raise HTTPException(status_code=400, detail="unsupported lang (use hi/en/es)")
 
-    job = load_job_for_artifacts(job_id)
-    job = _resolve_artifacts_and_patch(job_id, job)
+    # Ensure base job exists
+    _ = load_job_for_artifacts(job_id)
 
-    if job.get("status") != "done":
-        raise HTTPException(status_code=409, detail=f"job not done (status={job.get('status')})")
+    # Write queued status immediately
+    write_dub_status(job_id, lang, "queued")
 
-    vp = job.get("video_path")
-    ap = job.get("audio_path")
-    if not vp or not ap:
-        raise HTTPException(status_code=404, detail="base artifacts missing")
+    # Spawn background subprocess like your clip job
+    env = os.environ.copy()
+    env["CLIPLINGUA_DUB_JOB_ID"] = job_id
+    env["CLIPLINGUA_DUB_LANG"] = lang
 
-    video_in = safe_file_or_404(vp, "video missing")
-    audio_in = safe_file_or_404(ap, "audio missing")
+    runner = (
+        "import os;"
+        "from app.main import process_dub;"
+        "process_dub(os.environ['CLIPLINGUA_DUB_JOB_ID'], os.environ['CLIPLINGUA_DUB_LANG'])"
+    )
 
-    out_audio = dub_audio_path(job_id, lang)
-    out_video = dub_video_path(job_id, lang)
+    dd = dub_dir(job_id, lang)
+    dd.mkdir(parents=True, exist_ok=True)
+    runner_log = open(dd / "runner.log", "a", encoding="utf-8")
 
-    # If already exists, return quickly
-    if out_audio.exists() and out_video.exists():
-        return {"ok": True, "lang": lang, "cached": True}
+    subprocess.Popen(
+        [sys.executable, "-u", "-c", runner],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdout=runner_log,
+        stderr=runner_log,
+        env=env,
+        start_new_session=True,
+    )
 
-    ffmpeg_bin = require_bin("ffmpeg")
+    return {
+        "ok": True,
+        "lang": lang,
+        "status_url": f"/jobs/{job_id}/dubs/{lang}/status",
+        "audio_url": f"/jobs/{job_id}/dubs/{lang}/audio",
+        "video_url": f"/jobs/{job_id}/dubs/{lang}/video",
+        "log_url": f"/jobs/{job_id}/dubs/{lang}/log",
+    }
 
-    # 1) Transcribe base audio (cached at worker-level; we can persist later)
-    tr = whisper_transcribe(audio_in)
-    src_text = tr.get("text", "")
+@app.get("/jobs/{job_id}/dubs/{lang}/status")
+def get_dub_status(job_id: str, lang: str):
+    lang = (lang or "").strip().lower()
+    if lang not in SUPPORTED_DUB_LANGS:
+        raise HTTPException(status_code=400, detail="unsupported lang")
+    p = dub_status_path(job_id, lang)
+    if not p.exists():
+        return {"job_id": job_id, "lang": lang, "status": "not_started"}
+    return json.loads(p.read_text(encoding="utf-8"))
 
-    # 2) Translate (skip if lang == "en" and we assume source is english)
-    if lang == "en":
-        translated = src_text
-    else:
-        translated = nllb_translate(src_text, lang)
-
-    if not translated.strip():
-        raise HTTPException(status_code=500, detail="translation produced empty text")
-
-    # 3) TTS
-    xtts_speak(translated, lang, out_audio)
-
-    if not out_audio.exists() or out_audio.stat().st_size < 2048:
-        raise HTTPException(status_code=500, detail="dub audio not generated")
-
-    # 4) Mux
-    mux_audio_into_video(ffmpeg_bin, video_in, out_audio, out_video)
-
-    if not out_video.exists() or out_video.stat().st_size < 10_000:
-        raise HTTPException(status_code=500, detail="dub video not generated")
-
-    return {"ok": True, "lang": lang, "cached": False}
+@app.get("/jobs/{job_id}/dubs/{lang}/log", response_class=PlainTextResponse)
+def get_dub_log(job_id: str, lang: str):
+    lang = (lang or "").strip().lower()
+    p = dub_dir(job_id, lang) / "log.txt"
+    if not p.exists():
+        # fall back to runner log
+        rp = dub_dir(job_id, lang) / "runner.log"
+        if rp.exists():
+            return rp.read_text(encoding="utf-8", errors="ignore")
+        raise HTTPException(status_code=404, detail="log not ready")
+    return p.read_text(encoding="utf-8", errors="ignore")
 
 @app.get("/jobs/{job_id}/dubs/{lang}/audio")
 def get_dub_audio(job_id: str, lang: str):
