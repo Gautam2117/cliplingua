@@ -52,38 +52,53 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     except Exception:
         _supabase = None
 
-ARTIFACT_BUCKET = os.getenv("ARTIFACT_BUCKET", "artifacts").strip() or "artifacts"
+from typing import Optional
+from pathlib import Path
+
+ARTIFACT_BUCKET = (os.getenv("ARTIFACT_BUCKET", "artifacts") or "artifacts").strip()
 
 def storage_key(job_id: str, filename: str) -> str:
-    # jobs/<jobId>/<filename>
     return f"jobs/{job_id}/{filename}"
 
-def sb_upload_file(job_id: str, local_path: Path, filename: str) -> Optional[str]:
+def sb_upload_file(job_id: str, local_path: Path, filename: str, content_type: str) -> Optional[str]:
     """
     Upload local file to Supabase Storage and return the storage key.
-    Requires SUPABASE service role key.
+    Hard fail in logs when it breaks (no silent None without a trace).
     """
     if not _supabase:
-        return None
-    key = storage_key(job_id, filename)
-    try:
-        with open(local_path, "rb") as f:
-            _supabase.storage.from_(ARTIFACT_BUCKET).upload(
-                path=key,
-                file=f,
-                file_options={"content-type": "application/octet-stream", "upsert": "true"},
-            )
-        return key
-    except Exception:
         return None
 
-def sb_download_file(job_id: str, filename: str, dest_path: Path) -> bool:
-    """
-    Download from Supabase Storage to dest_path.
-    """
-    if not _supabase:
-        return False
     key = storage_key(job_id, filename)
+    try:
+        data = local_path.read_bytes()
+        if not data:
+            raise RuntimeError(f"empty file: {local_path}")
+
+        # supabase-py v2 expects bytes or file-like.
+        # file_options keys: contentType + upsert (bool)
+        res = _supabase.storage.from_(ARTIFACT_BUCKET).upload(
+            path=key,
+            file=data,
+            file_options={"contentType": content_type, "upsert": True},
+        )
+
+        # Some versions return dict-like, some return object. We only care that it didn't throw.
+        return key
+
+    except Exception as e:
+        # log both to Supabase log_text and local log if possible
+        try:
+            sb_append_log(job_id, f"\nSTORAGE_UPLOAD_ERROR ({filename}): {e}\n")
+        except Exception:
+            pass
+        return None
+
+def sb_download_key(key: str, dest_path: Path) -> bool:
+    """
+    Download a known storage key to dest_path.
+    """
+    if not _supabase or not key:
+        return False
     try:
         data = _supabase.storage.from_(ARTIFACT_BUCKET).download(key)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,6 +107,11 @@ def sb_download_file(job_id: str, filename: str, dest_path: Path) -> bool:
     except Exception:
         return False
 
+def sb_download_file(job_id: str, filename: str, dest_path: Path) -> bool:
+    """
+    Download by computed key jobs/<job_id>/<filename>.
+    """
+    return sb_download_key(storage_key(job_id, filename), dest_path)
 
 app = FastAPI(title="ClipLingua Worker", version="0.6.4")
 
@@ -163,16 +183,20 @@ def sb_upsert_job(job_id: str, payload: Dict[str, Any]) -> None:
             "status": payload.get("status", "queued"),
             "error": payload.get("error"),
             "updated_at": datetime.now(timezone.utc).isoformat(),
+
             "video_url": payload.get("video_url"),
             "audio_url": payload.get("audio_url"),
             "log_url": payload.get("log_url"),
+
+            # NEW: persist storage keys
+            "storage_video_key": payload.get("storage_video_key"),
+            "storage_audio_key": payload.get("storage_audio_key"),
+            "storage_log_key": payload.get("storage_log_key"),
         }
-        # Only set created_at on insert via default.
+
         _supabase.table("clip_jobs").upsert(row).execute()
     except Exception:
-        # Never fail the worker because Supabase hiccuped.
         pass
-
 
 def sb_get_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not _supabase:
@@ -512,16 +536,17 @@ def process_job(job_id: str, url: str) -> None:
         urls = _artifact_urls(job_id)
 
         # Persist to Supabase Storage so artifacts survive restarts
-        video_key = sb_upload_file(job_id, paths["video"], "video.mp4")
-        audio_key = sb_upload_file(job_id, paths["audio"], "audio.wav")
-        log_key = sb_upload_file(job_id, paths["log"], "log.txt")
+        video_key = sb_upload_file(job_id, paths["video"], "video.mp4", "video/mp4")
+        audio_key = sb_upload_file(job_id, paths["audio"], "audio.wav", "audio/wav")
+        log_key   = sb_upload_file(job_id, paths["log"],  "log.txt",  "text/plain")
 
-        # Store keys in job row (new columns or reuse json)
         persist_patch = {
             "storage_video_key": video_key,
             "storage_audio_key": audio_key,
             "storage_log_key": log_key,
         }
+
+        # Save keys (local + supabase row)
         update_job(job_id, persist_patch)
 
         update_job(
@@ -725,17 +750,26 @@ def get_job(job_id: str):
 
 @app.get("/jobs/{job_id}/log", response_class=PlainTextResponse)
 def get_job_log(job_id: str):
-    # Supabase first (persistent)
+    job = load_job(job_id)
+    paths = _job_artifact_paths(job_id)
+    lp = Path(job.get("log_path") or paths["log"])
+
+    # First try supabase log_text
     sb = sb_get_log(job_id)
-    if sb is not None and sb != "":
+    if sb:
         return sb
 
-    # Local fallback
-    jd = job_dir(job_id)
-    lp = jd / "log.txt"
+    # Then local
     if lp.exists():
         return lp.read_text(encoding="utf-8", errors="ignore")
-    rlp = jd / "runner.log"
+
+    # Then storage
+    ok = ensure_local_from_storage(job_id, job, "log.txt", lp, "storage_log_key")
+    if ok:
+        return lp.read_text(encoding="utf-8", errors="ignore")
+
+    # Then runner log
+    rlp = paths["runner_log"]
     if rlp.exists():
         return rlp.read_text(encoding="utf-8", errors="ignore")
 
@@ -826,18 +860,41 @@ def load_job_for_artifacts(job_id: str) -> Dict[str, Any]:
     # fallback
     return load_job(job_id)
 
+def ensure_local_from_storage(job_id: str, job: Dict[str, Any], filename: str, local_path: Path, key_field: str) -> bool:
+    """
+    Ensure local_path exists. If missing, download from storage using saved key, else fallback computed key.
+    """
+    try:
+        if local_path.exists() and local_path.stat().st_size > 0:
+            return True
+    except Exception:
+        pass
+
+    key = job.get(key_field)
+    if key:
+        ok = sb_download_key(key, local_path)
+        if ok:
+            return True
+
+    # fallback to computed key
+    return sb_download_file(job_id, filename, local_path)
+
 @app.get("/jobs/{job_id}/audio")
 def get_job_audio(job_id: str):
-    job = load_job_for_artifacts(job_id)
-    job = _resolve_artifacts_and_patch(job_id, job)
+    job = load_job(job_id)
+    paths = _job_artifact_paths(job_id)
 
     ap = job.get("audio_path")
-    if not ap:
+    local_p = Path(ap) if ap else paths["audio"]
+
+    ok = ensure_local_from_storage(job_id, job, "audio.wav", local_p, "storage_audio_key")
+    if not ok:
         raise HTTPException(status_code=404, detail="audio not ready")
 
-    p = safe_file_or_404(ap, "audio file missing")
-    return FileResponse(path=str(p), media_type="audio/wav", filename=f"{job_id}.wav")
+    if not job.get("audio_path"):
+        update_job(job_id, {"audio_path": str(local_p.resolve()), "updated_at": now_iso(), "updated_at_ts": time.time()})
 
+    return FileResponse(path=str(local_p), media_type="audio/wav", filename=f"{job_id}.wav")
 
 @app.head("/jobs/{job_id}/audio")
 def head_job_audio(job_id: str):
@@ -848,15 +905,22 @@ def head_job_audio(job_id: str):
 
 @app.get("/jobs/{job_id}/video")
 def get_job_video(job_id: str):
-    job = load_job_for_artifacts(job_id)
-    job = _resolve_artifacts_and_patch(job_id, job)
+    job = load_job(job_id)  # IMPORTANT: use supabase row which has storage keys
+    paths = _job_artifact_paths(job_id)
 
+    # try local path first
     vp = job.get("video_path")
-    if not vp:
+    local_p = Path(vp) if vp else paths["video"]
+
+    ok = ensure_local_from_storage(job_id, job, "video.mp4", local_p, "storage_video_key")
+    if not ok:
         raise HTTPException(status_code=404, detail="video not ready")
 
-    p = safe_file_or_404(vp, "video file missing")
-    return FileResponse(path=str(p), media_type="video/mp4", filename=f"{job_id}.mp4")
+    # patch job.json if needed
+    if not job.get("video_path"):
+        update_job(job_id, {"video_path": str(local_p.resolve()), "updated_at": now_iso(), "updated_at_ts": time.time()})
+
+    return FileResponse(path=str(local_p), media_type="video/mp4", filename=f"{job_id}.mp4")
 
 
 @app.head("/jobs/{job_id}/video")
@@ -871,41 +935,26 @@ class DubBody(BaseModel):
 from urllib.request import urlretrieve
 
 def ensure_base_artifacts_local(job_id: str, job: Dict[str, Any]) -> Tuple[Path, Path]:
-    """
-    Ensure we have base video/audio files locally.
-    Prefer job['video_path']/job['audio_path'] if present and exists.
-    Otherwise download from job['video_url']/job['audio_url'] into JOB_STORE_DIR.
-    """
     paths = _job_artifact_paths(job_id)
     paths["job_dir"].mkdir(parents=True, exist_ok=True)
 
-    # 1) If we have paths and files exist, use them
-    vp = job.get("video_path")
-    ap = job.get("audio_path")
+    video_p = Path(job["video_path"]) if job.get("video_path") else paths["video"]
+    audio_p = Path(job["audio_path"]) if job.get("audio_path") else paths["audio"]
 
-    if vp and Path(vp).exists():
-        video_p = Path(vp)
-    else:
-        # fallback to canonical location
-        video_p = paths["video"]
-
-    if ap and Path(ap).exists():
-        audio_p = Path(ap)
-    else:
-        audio_p = paths["audio"]
-
-    # 2) If missing locally, try Supabase Storage
+    # If missing locally, pull from Storage using stored keys
     if (not video_p.exists()) or video_p.stat().st_size < 10_000:
-        ok = sb_download_file(job_id, "video.mp4", video_p)
+        key = job.get("storage_video_key") or storage_key(job_id, "video.mp4")
+        ok = sb_download_key(key, video_p)
         if not ok:
             raise RuntimeError("base video missing locally and not found in storage")
 
     if (not audio_p.exists()) or audio_p.stat().st_size < 2_000:
-        ok = sb_download_file(job_id, "audio.wav", audio_p)
+        key = job.get("storage_audio_key") or storage_key(job_id, "audio.wav")
+        ok = sb_download_key(key, audio_p)
         if not ok:
             raise RuntimeError("base audio missing locally and not found in storage")
 
-    # 3) Patch job.json so future reads have paths
+    # Patch paths for consistency
     patch = {}
     if not job.get("video_path"):
         patch["video_path"] = str(video_p.resolve())
@@ -914,7 +963,7 @@ def ensure_base_artifacts_local(job_id: str, job: Dict[str, Any]) -> Tuple[Path,
     if patch:
         patch["updated_at"] = now_iso()
         patch["updated_at_ts"] = time.time()
-        update_job(job_id, patch)  # saves locally and upserts supabase (safe)
+        update_job(job_id, patch)
 
     return video_p, audio_p
 
