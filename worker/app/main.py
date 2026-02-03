@@ -809,6 +809,60 @@ def head_job_video(job_id: str):
 class DubBody(BaseModel):
     lang: str  # "hi" | "en" | "es"
 
+from urllib.request import urlretrieve
+
+def ensure_base_artifacts_local(job_id: str, job: Dict[str, Any]) -> Tuple[Path, Path]:
+    """
+    Ensure we have base video/audio files locally.
+    Prefer job['video_path']/job['audio_path'] if present and exists.
+    Otherwise download from job['video_url']/job['audio_url'] into JOB_STORE_DIR.
+    """
+    paths = _job_artifact_paths(job_id)
+    paths["job_dir"].mkdir(parents=True, exist_ok=True)
+
+    # 1) If we have paths and files exist, use them
+    vp = job.get("video_path")
+    ap = job.get("audio_path")
+
+    if vp and Path(vp).exists():
+        video_p = Path(vp)
+    else:
+        # fallback to canonical location
+        video_p = paths["video"]
+
+    if ap and Path(ap).exists():
+        audio_p = Path(ap)
+    else:
+        audio_p = paths["audio"]
+
+    # 2) Download if missing
+    if (not video_p.exists()) or video_p.stat().st_size < 10_000:
+        vurl = job.get("video_url") or (f"{PUBLIC_BASE_URL}/jobs/{job_id}/video" if PUBLIC_BASE_URL else None)
+        if not vurl:
+            raise RuntimeError("missing video_url and no PUBLIC_BASE_URL configured")
+        video_p.parent.mkdir(parents=True, exist_ok=True)
+        urlretrieve(vurl, str(video_p))
+
+    if (not audio_p.exists()) or audio_p.stat().st_size < 2_000:
+        aurl = job.get("audio_url") or (f"{PUBLIC_BASE_URL}/jobs/{job_id}/audio" if PUBLIC_BASE_URL else None)
+        if not aurl:
+            raise RuntimeError("missing audio_url and no PUBLIC_BASE_URL configured")
+        audio_p.parent.mkdir(parents=True, exist_ok=True)
+        urlretrieve(aurl, str(audio_p))
+
+    # 3) Patch job.json so future reads have paths
+    patch = {}
+    if not job.get("video_path"):
+        patch["video_path"] = str(video_p.resolve())
+    if not job.get("audio_path"):
+        patch["audio_path"] = str(audio_p.resolve())
+    if patch:
+        patch["updated_at"] = now_iso()
+        patch["updated_at_ts"] = time.time()
+        update_job(job_id, patch)  # saves locally and upserts supabase (safe)
+
+    return video_p, audio_p
+
 def process_dub(job_id: str, lang: str) -> None:
     lang = (lang or "").strip().lower()
     if lang not in SUPPORTED_DUB_LANGS:
@@ -833,8 +887,7 @@ def process_dub(job_id: str, lang: str) -> None:
         if job.get("status") != "done":
             raise RuntimeError(f"base job not done (status={job.get('status')})")
 
-        video_in = safe_file_or_404(job.get("video_path"), "video missing")
-        audio_in = safe_file_or_404(job.get("audio_path"), "audio missing")
+        video_in, audio_in = ensure_base_artifacts_local(job_id, job)
 
         out_audio = dub_audio_path(job_id, lang)
         out_video = dub_video_path(job_id, lang)
@@ -963,3 +1016,4 @@ def get_dub_video(job_id: str, lang: str):
     if not p.exists():
         raise HTTPException(status_code=404, detail="dub video not ready")
     return FileResponse(path=str(p), media_type="video/mp4", filename=f"{job_id}_{lang}.mp4")
+
