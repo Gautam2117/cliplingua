@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 from functools import lru_cache
+from urllib.request import urlretrieve
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, FileResponse, Response
@@ -50,6 +51,46 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
         _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     except Exception:
         _supabase = None
+
+ARTIFACT_BUCKET = os.getenv("ARTIFACT_BUCKET", "artifacts").strip() or "artifacts"
+
+def storage_key(job_id: str, filename: str) -> str:
+    # jobs/<jobId>/<filename>
+    return f"jobs/{job_id}/{filename}"
+
+def sb_upload_file(job_id: str, local_path: Path, filename: str) -> Optional[str]:
+    """
+    Upload local file to Supabase Storage and return the storage key.
+    Requires SUPABASE service role key.
+    """
+    if not _supabase:
+        return None
+    key = storage_key(job_id, filename)
+    try:
+        with open(local_path, "rb") as f:
+            _supabase.storage.from_(ARTIFACT_BUCKET).upload(
+                path=key,
+                file=f,
+                file_options={"content-type": "application/octet-stream", "upsert": "true"},
+            )
+        return key
+    except Exception:
+        return None
+
+def sb_download_file(job_id: str, filename: str, dest_path: Path) -> bool:
+    """
+    Download from Supabase Storage to dest_path.
+    """
+    if not _supabase:
+        return False
+    key = storage_key(job_id, filename)
+    try:
+        data = _supabase.storage.from_(ARTIFACT_BUCKET).download(key)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_bytes(data)
+        return dest_path.exists() and dest_path.stat().st_size > 0
+    except Exception:
+        return False
 
 
 app = FastAPI(title="ClipLingua Worker", version="0.6.4")
@@ -215,6 +256,10 @@ def load_job(job_id: str) -> Dict[str, Any]:
             "log_url": sb.get("log_url"),
             "created_at": sb.get("created_at"),
             "updated_at": sb.get("updated_at"),
+            "storage_video_key": sb.get("storage_video_key"),
+            "storage_audio_key": sb.get("storage_audio_key"),
+            "storage_log_key": sb.get("storage_log_key"),
+
         }
 
     local = load_job_local(job_id)
@@ -465,6 +510,20 @@ def process_job(job_id: str, url: str) -> None:
         sb_append_log(job_id, "\n== DONE ==\n")
 
         urls = _artifact_urls(job_id)
+
+        # Persist to Supabase Storage so artifacts survive restarts
+        video_key = sb_upload_file(job_id, paths["video"], "video.mp4")
+        audio_key = sb_upload_file(job_id, paths["audio"], "audio.wav")
+        log_key = sb_upload_file(job_id, paths["log"], "log.txt")
+
+        # Store keys in job row (new columns or reuse json)
+        persist_patch = {
+            "storage_video_key": video_key,
+            "storage_audio_key": audio_key,
+            "storage_log_key": log_key,
+        }
+        update_job(job_id, persist_patch)
+
         update_job(
             job_id,
             {
@@ -835,20 +894,16 @@ def ensure_base_artifacts_local(job_id: str, job: Dict[str, Any]) -> Tuple[Path,
     else:
         audio_p = paths["audio"]
 
-    # 2) Download if missing
+    # 2) If missing locally, try Supabase Storage
     if (not video_p.exists()) or video_p.stat().st_size < 10_000:
-        vurl = job.get("video_url") or (f"{PUBLIC_BASE_URL}/jobs/{job_id}/video" if PUBLIC_BASE_URL else None)
-        if not vurl:
-            raise RuntimeError("missing video_url and no PUBLIC_BASE_URL configured")
-        video_p.parent.mkdir(parents=True, exist_ok=True)
-        urlretrieve(vurl, str(video_p))
+        ok = sb_download_file(job_id, "video.mp4", video_p)
+        if not ok:
+            raise RuntimeError("base video missing locally and not found in storage")
 
     if (not audio_p.exists()) or audio_p.stat().st_size < 2_000:
-        aurl = job.get("audio_url") or (f"{PUBLIC_BASE_URL}/jobs/{job_id}/audio" if PUBLIC_BASE_URL else None)
-        if not aurl:
-            raise RuntimeError("missing audio_url and no PUBLIC_BASE_URL configured")
-        audio_p.parent.mkdir(parents=True, exist_ok=True)
-        urlretrieve(aurl, str(audio_p))
+        ok = sb_download_file(job_id, "audio.wav", audio_p)
+        if not ok:
+            raise RuntimeError("base audio missing locally and not found in storage")
 
     # 3) Patch job.json so future reads have paths
     patch = {}
