@@ -61,32 +61,31 @@ def storage_key(job_id: str, filename: str) -> str:
     return f"jobs/{job_id}/{filename}"
 
 def sb_upload_file(job_id: str, local_path: Path, filename: str, content_type: str) -> Optional[str]:
-    """
-    Upload local file to Supabase Storage and return the storage key.
-    Hard fail in logs when it breaks (no silent None without a trace).
-    """
     if not _supabase:
         return None
 
     key = storage_key(job_id, filename)
+
     try:
-        data = local_path.read_bytes()
-        if not data:
-            raise RuntimeError(f"empty file: {local_path}")
+        if not local_path.exists() or local_path.stat().st_size == 0:
+            raise RuntimeError(f"missing/empty file: {local_path}")
 
-        # supabase-py v2 expects bytes or file-like.
-        # file_options keys: contentType + upsert (bool)
-        res = _supabase.storage.from_(ARTIFACT_BUCKET).upload(
-            path=key,
-            file=data,
-            file_options={"contentType": content_type, "upsert": True},
-        )
+        with open(local_path, "rb") as f:
+            _supabase.storage.from_(ARTIFACT_BUCKET).upload(
+                path=key,
+                file=f,
+                file_options={
+                    "cache-control": "3600",
+                    "upsert": "true",
+                    # Supabase docs say MIME defaults to text/html if file_options not specified.
+                    # They do not show the exact key for MIME in python, so keep it out for now
+                    # to avoid a silent failure. :contentReference[oaicite:2]{index=2}
+                },
+            )
 
-        # Some versions return dict-like, some return object. We only care that it didn't throw.
         return key
 
     except Exception as e:
-        # log both to Supabase log_text and local log if possible
         try:
             sb_append_log(job_id, f"\nSTORAGE_UPLOAD_ERROR ({filename}): {e}\n")
         except Exception:

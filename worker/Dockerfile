@@ -15,4 +15,4 @@ COPY . .
 ENV DATA_DIR=/var/lib/cliplingua
 ENV TMP_DIR=/tmp/cliplingua/tmp
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "worker.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
