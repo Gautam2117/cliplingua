@@ -5,9 +5,9 @@ pydantic==2.9.2
 yt-dlp>=2024.12.23
 supabase>=2.6.0
 faster-whisper==1.0.3
-ctranslate2==4.4.0
+ctranslate2==4.7.0
 transformers==4.45.2
 sentencepiece==0.2.0
-torch==2.2.2
+torch>=2.4.0
 TTS==0.22.0
 numpy==1.26.4

@@ -794,7 +794,9 @@ def dub_job(job_id: str, body: DubBody):
     if lang not in SUPPORTED_DUB_LANGS:
         raise HTTPException(status_code=400, detail="unsupported lang (use hi/en/es)")
 
-    job = load_job(job_id)
+    job = load_job_for_artifacts(job_id)
+    job = _resolve_artifacts_and_patch(job_id, job)
+
     if job.get("status") != "done":
         raise HTTPException(status_code=409, detail=f"job not done (status={job.get('status')})")
 
