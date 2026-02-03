@@ -8,6 +8,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
+from functools import lru_cache
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, FileResponse, Response
@@ -53,10 +54,34 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 
 app = FastAPI(title="ClipLingua Worker", version="0.6.4")
 
+@lru_cache(maxsize=1)
+def get_models():
+    """
+    Lazy-load models once per worker instance.
+    Keeps them in memory for faster subsequent jobs.
+    """
+    models = {}
+
+    # 1) ASR: faster-whisper
+    from faster_whisper import WhisperModel
+    # tiny/medium tradeoff: start with "small" for quality-speed balance on CPU
+    models["whisper"] = WhisperModel("small", device="cpu", compute_type="int8")
+
+    # 2) Translator: NLLB (offline)
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    nllb_model = "facebook/nllb-200-distilled-600M"
+    models["nllb_tokenizer"] = AutoTokenizer.from_pretrained(nllb_model)
+    models["nllb"] = AutoModelForSeq2SeqLM.from_pretrained(nllb_model)
+
+    # 3) TTS: Coqui XTTS v2
+    # Heavy model. We load it once.
+    from TTS.api import TTS
+    models["tts"] = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+
+    return models
 
 class CreateJobBody(BaseModel):
     url: HttpUrl
-
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -294,6 +319,16 @@ def _job_artifact_paths(job_id: str) -> Dict[str, Path]:
         "runner_log": jd / "runner.log",
     }
 
+SUPPORTED_DUB_LANGS = {"hi", "en", "es"}
+
+def dub_dir(job_id: str, lang: str) -> Path:
+    return job_dir(job_id) / "dubs" / lang
+
+def dub_audio_path(job_id: str, lang: str) -> Path:
+    return dub_dir(job_id, lang) / "audio.wav"
+
+def dub_video_path(job_id: str, lang: str) -> Path:
+    return dub_dir(job_id, lang) / "video.mp4"
 
 def process_job(job_id: str, url: str) -> None:
     tmp_job_dir = TMP_DIR / job_id
@@ -457,6 +492,80 @@ def process_job(job_id: str, url: str) -> None:
             shutil.rmtree(tmp_job_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+def whisper_transcribe(audio_path: Path) -> Dict[str, Any]:
+    m = get_models()
+    whisper = m["whisper"]
+
+    segments, info = whisper.transcribe(str(audio_path), beam_size=3)
+    seg_list = []
+    full = []
+    for s in segments:
+        seg_list.append({"start": s.start, "end": s.end, "text": s.text})
+        full.append(s.text.strip())
+    return {
+        "language": getattr(info, "language", None),
+        "text": " ".join([t for t in full if t]),
+        "segments": seg_list,
+    }
+
+def nllb_translate(text: str, target_lang: str) -> str:
+    """
+    target_lang: hi/en/es
+    NLLB language codes:
+      - eng_Latn
+      - hin_Deva
+      - spa_Latn
+    """
+    if not text.strip():
+        return ""
+
+    tgt_map = {"en": "eng_Latn", "hi": "hin_Deva", "es": "spa_Latn"}
+    tgt = tgt_map[target_lang]
+
+    m = get_models()
+    tok = m["nllb_tokenizer"]
+    model = m["nllb"]
+
+    # NLLB needs src_lang set sometimes; we keep it generic.
+    inputs = tok(text, return_tensors="pt", truncation=True, max_length=1024)
+
+    forced_bos = tok.convert_tokens_to_ids(tgt)
+    out = model.generate(**inputs, forced_bos_token_id=forced_bos, max_new_tokens=512)
+
+    return tok.batch_decode(out, skip_special_tokens=True)[0]
+
+def xtts_speak(text: str, lang: str, out_wav: Path) -> None:
+    """
+    XTTS supports language codes like: "en", "es", "hi"
+    Voice cloning is optional; for now we use default speaker.
+    """
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    m = get_models()
+    tts = m["tts"]
+
+    # XTTS can synthesize directly to file
+    tts.tts_to_file(text=text, file_path=str(out_wav), language=lang)
+
+def mux_audio_into_video(ffmpeg_bin: str, video_in: Path, audio_in: Path, video_out: Path) -> None:
+    video_out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", str(video_in),
+        "-i", str(audio_in),
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-shortest",
+        str(video_out),
+    ]
+    rc, out = run_cmd(cmd, cwd=None)
+    if rc != 0:
+        tail = "\n".join(out.splitlines()[-120:])
+        raise RuntimeError(f"ffmpeg mux failed (rc={rc})\n{tail}")
 
 
 @app.get("/health")
@@ -675,3 +784,80 @@ def head_job_video(job_id: str):
     job = load_job_for_artifacts(job_id)
     job = _resolve_artifacts_and_patch(job_id, job)
     return _file_head_or_404(job.get("video_path"))
+
+class DubBody(BaseModel):
+    lang: str  # "hi" | "en" | "es"
+
+@app.post("/jobs/{job_id}/dub")
+def dub_job(job_id: str, body: DubBody):
+    lang = (body.lang or "").strip().lower()
+    if lang not in SUPPORTED_DUB_LANGS:
+        raise HTTPException(status_code=400, detail="unsupported lang (use hi/en/es)")
+
+    job = load_job(job_id)
+    if job.get("status") != "done":
+        raise HTTPException(status_code=409, detail=f"job not done (status={job.get('status')})")
+
+    vp = job.get("video_path")
+    ap = job.get("audio_path")
+    if not vp or not ap:
+        raise HTTPException(status_code=404, detail="base artifacts missing")
+
+    video_in = safe_file_or_404(vp, "video missing")
+    audio_in = safe_file_or_404(ap, "audio missing")
+
+    out_audio = dub_audio_path(job_id, lang)
+    out_video = dub_video_path(job_id, lang)
+
+    # If already exists, return quickly
+    if out_audio.exists() and out_video.exists():
+        return {"ok": True, "lang": lang, "cached": True}
+
+    ffmpeg_bin = require_bin("ffmpeg")
+
+    # 1) Transcribe base audio (cached at worker-level; we can persist later)
+    tr = whisper_transcribe(audio_in)
+    src_text = tr.get("text", "")
+
+    # 2) Translate (skip if lang == "en" and we assume source is english)
+    if lang == "en":
+        translated = src_text
+    else:
+        translated = nllb_translate(src_text, lang)
+
+    if not translated.strip():
+        raise HTTPException(status_code=500, detail="translation produced empty text")
+
+    # 3) TTS
+    xtts_speak(translated, lang, out_audio)
+
+    if not out_audio.exists() or out_audio.stat().st_size < 2048:
+        raise HTTPException(status_code=500, detail="dub audio not generated")
+
+    # 4) Mux
+    mux_audio_into_video(ffmpeg_bin, video_in, out_audio, out_video)
+
+    if not out_video.exists() or out_video.stat().st_size < 10_000:
+        raise HTTPException(status_code=500, detail="dub video not generated")
+
+    return {"ok": True, "lang": lang, "cached": False}
+
+@app.get("/jobs/{job_id}/dubs/{lang}/audio")
+def get_dub_audio(job_id: str, lang: str):
+    lang = (lang or "").strip().lower()
+    if lang not in SUPPORTED_DUB_LANGS:
+        raise HTTPException(status_code=400, detail="unsupported lang")
+    p = dub_audio_path(job_id, lang)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="dub audio not ready")
+    return FileResponse(path=str(p), media_type="audio/wav", filename=f"{job_id}_{lang}.wav")
+
+@app.get("/jobs/{job_id}/dubs/{lang}/video")
+def get_dub_video(job_id: str, lang: str):
+    lang = (lang or "").strip().lower()
+    if lang not in SUPPORTED_DUB_LANGS:
+        raise HTTPException(status_code=400, detail="unsupported lang")
+    p = dub_video_path(job_id, lang)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="dub video not ready")
+    return FileResponse(path=str(p), media_type="video/mp4", filename=f"{job_id}_{lang}.mp4")
