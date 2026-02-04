@@ -1167,3 +1167,10 @@ def get_dub_video(job_id: str, lang: str):
         raise HTTPException(status_code=404, detail="dub video not ready")
     return FileResponse(path=str(p), media_type="video/mp4", filename=f"{job_id}_{lang}.mp4")
 
+@app.get("/jobs/{job_id}/dubs/{lang}/runner", response_class=PlainTextResponse)
+def get_dub_runner_log(job_id: str, lang: str):
+    lang = (lang or "").strip().lower()
+    p = dub_dir(job_id, lang) / "runner.log"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="runner log not ready")
+    return p.read_text(encoding="utf-8", errors="ignore")
