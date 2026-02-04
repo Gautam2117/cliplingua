@@ -293,12 +293,33 @@ def load_job(job_id: str) -> Dict[str, Any]:
 
 
 def update_job(job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
-    local = load_job_local(job_id) or {"id": job_id}
+    local = load_job_local(job_id)
+
+    if not local:
+        # pull existing supabase job to avoid writing incomplete job.json
+        sb = sb_get_job(job_id)
+        if sb:
+            local = {
+                "id": str(sb.get("id")),
+                "url": sb.get("url"),
+                "status": sb.get("status"),
+                "error": sb.get("error"),
+                "video_url": sb.get("video_url"),
+                "audio_url": sb.get("audio_url"),
+                "log_url": sb.get("log_url"),
+                "created_at": sb.get("created_at"),
+                "updated_at": sb.get("updated_at"),
+                "storage_video_key": sb.get("storage_video_key"),
+                "storage_audio_key": sb.get("storage_audio_key"),
+                "storage_log_key": sb.get("storage_log_key"),
+            }
+        else:
+            local = {"id": job_id}
+
     local.update(patch)
     save_job_local(job_id, local)
     sb_upsert_job(job_id, local)
     return local
-
 
 def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     proc = subprocess.run(
@@ -847,16 +868,42 @@ def _resolve_artifacts_and_patch(job_id: str, job: Dict[str, Any]) -> Dict[str, 
     return job
 
 def load_job_for_artifacts(job_id: str) -> Dict[str, Any]:
-    """
-    For serving files, always prefer local job.json because it contains
-    video_path/audio_path and points to files in JOB_STORE_DIR.
-    Supabase row may not have those columns.
-    """
     local = load_job_local(job_id)
-    if local:
+
+    # If local exists but is incomplete (common after patching video_path/audio_path),
+    # fall back to Supabase as source of truth.
+    if local and local.get("status"):
         return local
 
+    sb = sb_get_job(job_id)
+    if sb:
+        # normalize shape similar to /jobs/{id}
+        job = {
+            "id": str(sb.get("id")),
+            "url": sb.get("url"),
+            "status": sb.get("status"),
+            "error": sb.get("error"),
+            "video_url": sb.get("video_url"),
+            "audio_url": sb.get("audio_url"),
+            "log_url": sb.get("log_url"),
+            "created_at": sb.get("created_at"),
+            "updated_at": sb.get("updated_at"),
+            "storage_video_key": sb.get("storage_video_key"),
+            "storage_audio_key": sb.get("storage_audio_key"),
+            "storage_log_key": sb.get("storage_log_key"),
+        }
+
+        # If local exists, merge it in (keep local paths)
+        if local:
+            job.update(local)
+
+        # Write back a complete local json so future reads work
+        save_job_local(job_id, job)
+        return job
+
     # fallback
+    if local:
+        return local
     return load_job(job_id)
 
 def ensure_local_from_storage(job_id: str, job: Dict[str, Any], filename: str, local_path: Path, key_field: str) -> bool:
