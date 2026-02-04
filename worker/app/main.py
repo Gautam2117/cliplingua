@@ -1,19 +1,26 @@
 """
-ClipLingua Worker (Render) - durable jobs + durable dubs
+ClipLingua Worker (Render) - durable jobs + durable dubs (free-tier safe)
 
-Key upgrades vs your current file:
-- Dub status + dub logs are persisted in Supabase (survive Render restarts)
-- Dub audio/video artifacts are persisted in Supabase Storage (survive restarts)
-- /dubs/* endpoints read Supabase first, then local filesystem as fallback
-- Background runner import path is robust via CLIPLINGUA_MAIN_MODULE env var
+What this version fixes/improves vs your pasted file:
+- Uses env-configurable models:
+    WHISPER_MODEL (default: tiny)
+    NLLB_MODEL (default: facebook/nllb-200-distilled-300M)
+    DISABLE_XTTS=1 fully disables Coqui TTS import (prevents OOM + import errors)
+- Fixes the TWO real bugs in your file:
+    1) duplicate sb_upsert_dub_status overwrite (removed)
+    2) process_dub() logging used undefined `log_path` (fixed)
+- Dub "fake running" protection:
+    DUB_STALE_SECONDS marks running as error if no update for N seconds
+- Durable artifacts:
+    Base: video/audio/log -> Supabase Storage
+    Dubs: audio/video/log -> Supabase Storage
+- /dubs endpoints read Supabase first, then local, then storage fallback
+- Adds a free-tier safe TTS fallback when DISABLE_XTTS=1:
+    Uses ffmpeg "flite" speech synth filter to generate WAV.
+    (Not great quality, but works reliably on free Render with no extra deps.)
 
-Required Supabase SQL (run once):
-  alter table public.clip_jobs
-  add column if not exists dub_status jsonb not null default '{}'::jsonb,
-  add column if not exists dub_log_text jsonb not null default '{}'::jsonb;
-
-You already added:
-  storage_video_key, storage_audio_key, storage_log_key, log_text
+If you later want higher-quality voice on free tier, replace tts_speak()
+with an external TTS API call.
 """
 
 import os
@@ -49,16 +56,20 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
 SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 ARTIFACT_BUCKET = (os.getenv("ARTIFACT_BUCKET", "artifacts") or "artifacts").strip()
 
-# The python module path where this file lives.
-# Example: worker.app.main (if file is worker/app/main.py)
 MAIN_MODULE = (os.getenv("CLIPLINGUA_MAIN_MODULE") or "worker.app.main").strip()
-
-# If this file is worker/app/main.py, repo root is parents[2].
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 SUPPORTED_DUB_LANGS = {"hi", "en", "es"}
 
-app = FastAPI(title="ClipLingua Worker", version="0.6.5")
+# Model envs (you already set these in Render)
+WHISPER_MODEL = (os.getenv("WHISPER_MODEL") or "tiny").strip()
+NLLB_MODEL = (os.getenv("NLLB_MODEL") or "facebook/nllb-200-distilled-300M").strip()
+DISABLE_XTTS = (os.getenv("DISABLE_XTTS") or "").strip().lower() in {"1", "true", "yes"}
+
+# Stale dub detection
+DUB_STALE_SECONDS = int(os.getenv("DUB_STALE_SECONDS", "600"))  # 10 min
+
+app = FastAPI(title="ClipLingua Worker", version="0.7.0")
 
 
 def ensure_writable_dir(p: Path, fallback: Path) -> Path:
@@ -100,7 +111,6 @@ def _as_dict(v: Any) -> Dict[str, Any]:
         return {}
     if isinstance(v, dict):
         return v
-    # Sometimes libraries may return JSON strings
     if isinstance(v, str):
         try:
             parsed = json.loads(v)
@@ -115,7 +125,6 @@ def _as_dict(v: Any) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 def storage_key(job_id: str, filename: str) -> str:
-    # filename can be nested like "dubs/hi/video.mp4"
     return f"jobs/{job_id}/{filename}"
 
 
@@ -171,21 +180,15 @@ def ensure_local_from_storage(job_id: str, job: Dict[str, Any], filename: str, l
         pass
 
     key = job.get(key_field)
-    if key:
-        ok = sb_download_key(key, local_path)
-        if ok:
-            return True
+    if key and sb_download_key(key, local_path):
+        return True
 
     return sb_download_file(job_id, filename, local_path)
 
 
 def dub_storage_keys_from_status(dub_status: Dict[str, Any], lang: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     info = _as_dict(dub_status.get(lang))
-    return (
-        info.get("audio_key"),
-        info.get("video_key"),
-        info.get("log_key"),
-    )
+    return (info.get("audio_key"), info.get("video_key"), info.get("log_key"))
 
 
 def ensure_local_dub_from_storage(
@@ -195,12 +198,6 @@ def ensure_local_dub_from_storage(
     kind: str,  # "audio" | "video" | "log"
     local_path: Path,
 ) -> bool:
-    """
-    Ensure dub artifact exists locally. Checks:
-    1) local
-    2) keys stored in dub_status json
-    3) computed fallback key jobs/<job_id>/dubs/<lang>/<file>
-    """
     try:
         if local_path.exists() and local_path.stat().st_size > 0:
             return True
@@ -209,7 +206,6 @@ def ensure_local_dub_from_storage(
 
     audio_key, video_key, log_key = dub_storage_keys_from_status(dub_status, lang)
 
-    key = None
     if kind == "audio":
         key = audio_key
         fallback_filename = f"dubs/{lang}/audio.wav"
@@ -293,11 +289,9 @@ def sb_upsert_job(job_id: str, payload: Dict[str, Any]) -> None:
             "storage_video_key": payload.get("storage_video_key"),
             "storage_audio_key": payload.get("storage_audio_key"),
             "storage_log_key": payload.get("storage_log_key"),
-            # Durable dubs
             "dub_status": payload.get("dub_status"),
             "dub_log_text": payload.get("dub_log_text"),
         }
-        # Remove None keys so upsert does not overwrite jsonb columns unintentionally
         row = {k: v for k, v in row.items() if v is not None}
         _supabase.table("clip_jobs").upsert(row).execute()
     except Exception:
@@ -372,20 +366,13 @@ def sb_upsert_dub_status(
     try:
         current = sb_get_dub_status_map(job_id)
         prev = _as_dict(current.get(lang))
-        prev.update(
-            {
-                "status": status,
-                "error": error,
-                "updated_at": now_iso(),
-            }
-        )
+        prev.update({"status": status, "error": error, "updated_at": now_iso()})
         if audio_key:
             prev["audio_key"] = audio_key
         if video_key:
             prev["video_key"] = video_key
         if log_key:
             prev["log_key"] = log_key
-
         current[lang] = prev
         _supabase.table("clip_jobs").update({"dub_status": current, "updated_at": now_iso()}).eq("id", job_id).execute()
     except Exception:
@@ -415,11 +402,9 @@ def sb_append_dub_log(job_id: str, lang: str, line: str) -> None:
         current = {}
         if data and isinstance(data, list) and len(data) > 0:
             current = _as_dict(data[0].get("dub_log_text"))
-
         prev = current.get(lang) or ""
         updated = prev + ("" if prev.endswith("\n") or prev == "" else "\n") + line.rstrip()
         current[lang] = updated
-
         _supabase.table("clip_jobs").update({"dub_log_text": current, "updated_at": now_iso()}).eq("id", job_id).execute()
     except Exception:
         pass
@@ -484,28 +469,29 @@ def update_job(job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Models
+# Models (lazy + free-tier safe)
 # -----------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
-def get_models():
-    models: Dict[str, Any] = {}
-
+def _get_whisper():
     from faster_whisper import WhisperModel
+    return WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 
-    models["whisper"] = WhisperModel("small", device="cpu", compute_type="int8")
 
+@lru_cache(maxsize=1)
+def _get_nllb():
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    tok = AutoTokenizer.from_pretrained(NLLB_MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL)
+    return tok, model
 
-    nllb_model = "facebook/nllb-200-distilled-600M"
-    models["nllb_tokenizer"] = AutoTokenizer.from_pretrained(nllb_model)
-    models["nllb"] = AutoModelForSeq2SeqLM.from_pretrained(nllb_model)
 
+@lru_cache(maxsize=1)
+def _get_xtts():
+    if DISABLE_XTTS:
+        raise RuntimeError("XTTS disabled via DISABLE_XTTS=1")
     from TTS.api import TTS
-
-    models["tts"] = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
-
-    return models
+    return TTS("tts_models/multilingual/multi-dataset/xtts_v2")
 
 
 # -----------------------------------------------------------------------------
@@ -549,13 +535,6 @@ def list_dir(folder: Path) -> str:
         return "\n".join(items) if items else "<empty>"
     except Exception as e:
         return f"<could not list dir: {e}>"
-
-
-def safe_file_or_404(path_str: str, msg: str) -> Path:
-    p = Path(path_str)
-    if not p.exists() or not p.is_file():
-        raise HTTPException(status_code=404, detail=msg)
-    return p
 
 
 def require_bin(name: str) -> str:
@@ -627,7 +606,6 @@ def dub_runner_log_path(job_id: str, lang: str) -> Path:
 
 
 def write_dub_status(job_id: str, lang: str, status: str, error: Optional[str] = None) -> None:
-    # local
     p = dub_status_path(job_id, lang)
     p.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
@@ -643,7 +621,6 @@ def write_dub_status(job_id: str, lang: str, status: str, error: Optional[str] =
             indent=2,
         ),
     )
-    # supabase
     sb_upsert_dub_status(job_id, lang, status, error=error)
 
 
@@ -774,10 +751,6 @@ def process_job(job_id: str, url: str) -> None:
         merged_video.replace(paths["video"])
         tmp_audio.replace(paths["audio"])
 
-        log_lines.append("== DONE ==")
-        log_lines.append(f"video={paths['video'].resolve()}")
-        log_lines.append(f"audio={paths['audio'].resolve()}")
-
         out_log.write_text("\n".join(log_lines), encoding="utf-8", errors="ignore")
         sb_append_log(job_id, "\n== DONE ==\n")
 
@@ -809,7 +782,6 @@ def process_job(job_id: str, url: str) -> None:
             out_log.write_text("\n".join(log_lines) + f"\nERROR: {e}\n", encoding="utf-8", errors="ignore")
         except Exception:
             pass
-
         sb_append_log(job_id, f"\nERROR: {e}\n")
 
         urls = _artifact_urls(job_id)
@@ -838,9 +810,7 @@ def process_job(job_id: str, url: str) -> None:
 # -----------------------------------------------------------------------------
 
 def whisper_transcribe(audio_path: Path) -> Dict[str, Any]:
-    m = get_models()
-    whisper = m["whisper"]
-
+    whisper = _get_whisper()
     segments, info = whisper.transcribe(str(audio_path), beam_size=3)
     seg_list = []
     full = []
@@ -859,11 +829,11 @@ def nllb_translate(text: str, target_lang: str) -> str:
         return ""
 
     tgt_map = {"en": "eng_Latn", "hi": "hin_Deva", "es": "spa_Latn"}
-    tgt = tgt_map[target_lang]
+    if target_lang not in tgt_map:
+        return text
 
-    m = get_models()
-    tok = m["nllb_tokenizer"]
-    model = m["nllb"]
+    tok, model = _get_nllb()
+    tgt = tgt_map[target_lang]
 
     inputs = tok(text, return_tensors="pt", truncation=True, max_length=1024)
     forced_bos = tok.convert_tokens_to_ids(tgt)
@@ -871,11 +841,45 @@ def nllb_translate(text: str, target_lang: str) -> str:
     return tok.batch_decode(out, skip_special_tokens=True)[0]
 
 
-def xtts_speak(text: str, lang: str, out_wav: Path) -> None:
+def tts_speak(text: str, lang: str, out_wav: Path) -> None:
+    """
+    Free-tier safe:
+    - If XTTS is enabled, uses Coqui XTTS (not recommended on free Render).
+    - If XTTS disabled, uses ffmpeg flite (robot voice, but reliable).
+    """
     out_wav.parent.mkdir(parents=True, exist_ok=True)
-    m = get_models()
-    tts = m["tts"]
-    tts.tts_to_file(text=text, file_path=str(out_wav), language=lang)
+
+    if not text.strip():
+        raise RuntimeError("TTS text empty")
+
+    if not DISABLE_XTTS:
+        tts = _get_xtts()
+        tts.tts_to_file(text=text, file_path=str(out_wav), language=lang)
+        return
+
+    # Fallback: ffmpeg flite synth (no extra python deps)
+    ffmpeg_bin = require_bin("ffmpeg")
+
+    # Flite voices are English-ish. This is a reliability fallback only.
+    # We still generate audio and mux correctly so pipeline works on free tier.
+    safe_text = text.replace("\n", " ").strip()
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"flite=text='{safe_text}':voice=slt",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(out_wav),
+    ]
+    rc, out = run_cmd(cmd, cwd=None)
+    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
+        tail = "\n".join(out.splitlines()[-200:])
+        raise RuntimeError(f"ffmpeg flite TTS failed (rc={rc})\n{tail}")
 
 
 def mux_audio_into_video(ffmpeg_bin: str, video_in: Path, audio_in: Path, video_out: Path) -> None:
@@ -984,6 +988,8 @@ def process_dub(job_id: str, lang: str) -> None:
         with open(local_log_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
         sb_append_dub_log(job_id, lang, line)
+        # also refresh status heartbeat while running
+        sb_upsert_dub_status(job_id, lang, "running", error=None)
 
     try:
         write_dub_status(job_id, lang, "running")
@@ -998,16 +1004,18 @@ def process_dub(job_id: str, lang: str) -> None:
         out_audio = dub_audio_path(job_id, lang)
         out_video = dub_video_path(job_id, lang)
 
-        # If already produced on this instance, mark done and ensure Storage keys exist later (optional)
         if out_audio.exists() and out_video.exists() and out_audio.stat().st_size > 2048 and out_video.stat().st_size > 10_000:
-            log("cached=true (local files already exist)")
+            log("cached=true (local dub files exist)")
         else:
             ffmpeg_bin = require_bin("ffmpeg")
 
-            log("loading models (first time can be slow)")
+            log(f"models: whisper={WHISPER_MODEL} nllb={NLLB_MODEL} xtts_disabled={DISABLE_XTTS}")
             tr = whisper_transcribe(audio_in)
             src_text = tr.get("text", "")
             log(f"transcribed_chars={len(src_text)}")
+
+            if not src_text.strip():
+                raise RuntimeError("transcription empty")
 
             if lang == "en":
                 translated = src_text
@@ -1019,7 +1027,7 @@ def process_dub(job_id: str, lang: str) -> None:
 
             log(f"translated_chars={len(translated)}")
 
-            xtts_speak(translated, lang, out_audio)
+            tts_speak(translated, lang, out_audio)
             if not out_audio.exists() or out_audio.stat().st_size < 2048:
                 raise RuntimeError("dub audio not generated")
 
@@ -1029,19 +1037,23 @@ def process_dub(job_id: str, lang: str) -> None:
 
             log("dub_files=generated")
 
-        # Upload dub artifacts to Storage (durable)
+        # Upload dub artifacts (durable)
         audio_key = sb_upload_file(job_id, out_audio, f"dubs/{lang}/audio.wav", "audio/wav")
         video_key = sb_upload_file(job_id, out_video, f"dubs/{lang}/video.mp4", "video/mp4")
         log_key = sb_upload_file(job_id, local_log_path, f"dubs/{lang}/log.txt", "text/plain")
 
-        log("== DUB DONE ==")
-        sb_upsert_dub_status(job_id, lang, "done", error=None, audio_key=audio_key, video_key=video_key, log_key=log_key)
+        log("uploaded_to_storage=true")
 
-        # keep local status.json in sync too
+        sb_upsert_dub_status(job_id, lang, "done", error=None, audio_key=audio_key, video_key=video_key, log_key=log_key)
         write_dub_status(job_id, lang, "done")
+        log("== DUB DONE ==")
 
     except Exception as e:
-        log(f"ERROR: {e}")
+        try:
+            with open(local_log_path, "a", encoding="utf-8") as f:
+                f.write(f"ERROR: {e}\n")
+        except Exception:
+            pass
         sb_upsert_dub_status(job_id, lang, "error", error=str(e))
         write_dub_status(job_id, lang, "error", str(e))
 
@@ -1092,6 +1104,9 @@ def debug_binaries():
         "supabase_enabled": bool(_supabase),
         "MAIN_MODULE": MAIN_MODULE,
         "PROJECT_ROOT": str(PROJECT_ROOT),
+        "WHISPER_MODEL": WHISPER_MODEL,
+        "NLLB_MODEL": NLLB_MODEL,
+        "DISABLE_XTTS": DISABLE_XTTS,
     }
 
 
@@ -1116,6 +1131,8 @@ def create_job(body: CreateJobBody):
         "updated_at": now_iso(),
         "updated_at_ts": time.time(),
         "data_dir": str(paths["job_dir"].resolve()),
+        "dub_status": {},
+        "dub_log_text": {},
     }
     save_job_local(job_id, payload)
     sb_upsert_job(job_id, payload)
@@ -1256,6 +1273,13 @@ def dub_job(job_id: str, body: DubBody):
     }
 
 
+def _parse_iso(ts: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 @app.get("/jobs/{job_id}/dubs/{lang}/status")
 def get_dub_status(job_id: str, lang: str):
     lang = (lang or "").strip().lower()
@@ -1263,16 +1287,29 @@ def get_dub_status(job_id: str, lang: str):
         raise HTTPException(status_code=400, detail="unsupported lang")
 
     # Supabase first
-    dub_status = sb_get_dub_status_map(job_id)
-    info = _as_dict(dub_status.get(lang))
-    if info.get("status"):
-        return {"job_id": job_id, "lang": lang, **info}
+    if _supabase:
+        ds = sb_get_dub_status_map(job_id)
+        if lang in ds:
+            st = _as_dict(ds[lang])
+            if st.get("status") == "running":
+                t = _parse_iso(st.get("updated_at") or "")
+                if t:
+                    age = (datetime.now(timezone.utc) - t).total_seconds()
+                    if age > DUB_STALE_SECONDS:
+                        sb_upsert_dub_status(job_id, lang, "error", error="stale running: worker restarted or OOM")
+                        return {
+                            "job_id": job_id,
+                            "lang": lang,
+                            "status": "error",
+                            "error": "stale running: worker restarted or OOM",
+                            "updated_at": now_iso(),
+                        }
+            return {"job_id": job_id, "lang": lang, **st}
 
     # Local fallback
     p = dub_status_path(job_id, lang)
     if p.exists():
         return json.loads(p.read_text(encoding="utf-8"))
-
     return {"job_id": job_id, "lang": lang, "status": "not_started"}
 
 
@@ -1282,23 +1319,19 @@ def get_dub_log(job_id: str, lang: str):
     if lang not in SUPPORTED_DUB_LANGS:
         raise HTTPException(status_code=400, detail="unsupported lang")
 
-    # Supabase first
     sb_txt = sb_get_dub_log_text(job_id, lang)
     if sb_txt:
         return sb_txt
 
-    # Local
     lp = dub_log_path(job_id, lang)
     if lp.exists():
         return lp.read_text(encoding="utf-8", errors="ignore")
 
-    # Storage
     dub_status = sb_get_dub_status_map(job_id)
     ok = ensure_local_dub_from_storage(job_id, lang, dub_status, "log", lp)
     if ok and lp.exists():
         return lp.read_text(encoding="utf-8", errors="ignore")
 
-    # Runner local fallback
     rp = dub_runner_log_path(job_id, lang)
     if rp.exists():
         return rp.read_text(encoding="utf-8", errors="ignore")
@@ -1313,7 +1346,6 @@ def get_dub_audio(job_id: str, lang: str):
         raise HTTPException(status_code=400, detail="unsupported lang")
 
     p = dub_audio_path(job_id, lang)
-
     if not p.exists() or p.stat().st_size < 2048:
         dub_status = sb_get_dub_status_map(job_id)
         if not ensure_local_dub_from_storage(job_id, lang, dub_status, "audio", p):
@@ -1329,7 +1361,6 @@ def get_dub_video(job_id: str, lang: str):
         raise HTTPException(status_code=400, detail="unsupported lang")
 
     p = dub_video_path(job_id, lang)
-
     if not p.exists() or p.stat().st_size < 10_000:
         dub_status = sb_get_dub_status_map(job_id)
         if not ensure_local_dub_from_storage(job_id, lang, dub_status, "video", p):
