@@ -36,6 +36,8 @@ from typing import Optional, Tuple, List, Dict, Any
 from functools import lru_cache
 from datetime import datetime, timezone
 import importlib
+import urllib.parse
+import urllib.request
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, FileResponse, Response
@@ -47,6 +49,10 @@ load_dotenv()
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
+
+TRANSLATE_PROVIDER = (os.getenv("TRANSLATE_PROVIDER") or "google_free").strip().lower()
+ENABLE_LOCAL_NLLB = (os.getenv("ENABLE_LOCAL_NLLB") or "").strip().lower() in {"1", "true", "yes"}
+MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "4500"))
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/cliplingua/data"))
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp/cliplingua/tmp"))
@@ -823,23 +829,86 @@ def whisper_transcribe(audio_path: Path) -> Dict[str, Any]:
         "segments": seg_list,
     }
 
+def _truncate(s: str, n: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= n:
+        return s
+    return s[:n].rsplit(" ", 1)[0] if " " in s[:n] else s[:n]
 
-def nllb_translate(text: str, target_lang: str) -> str:
-    if not text.strip():
+
+def translate_text(text: str, target_lang: str) -> str:
+    """
+    Memory-safe translation:
+    - Default: Google unofficial endpoint (no key)
+    - Option: LibreTranslate (URL + optional key)
+    - Optional: Local NLLB only when ENABLE_LOCAL_NLLB=1 on higher RAM
+    """
+    text = _truncate(text, MAX_TRANSCRIPT_CHARS)
+    if not text:
         return ""
 
-    tgt_map = {"en": "eng_Latn", "hi": "hin_Deva", "es": "spa_Latn"}
-    if target_lang not in tgt_map:
+    if target_lang == "en":
         return text
 
-    tok, model = _get_nllb()
-    tgt = tgt_map[target_lang]
+    # ---- Local NLLB (only for bigger instances) ----
+    if ENABLE_LOCAL_NLLB:
+        # WARNING: likely OOM on free Render
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-    inputs = tok(text, return_tensors="pt", truncation=True, max_length=1024)
-    forced_bos = tok.convert_tokens_to_ids(tgt)
-    out = model.generate(**inputs, forced_bos_token_id=forced_bos, max_new_tokens=512)
-    return tok.batch_decode(out, skip_special_tokens=True)[0]
+        nllb_model = NLLB_MODEL
+        tok = AutoTokenizer.from_pretrained(nllb_model)
+        model = AutoModelForSeq2SeqLM.from_pretrained(nllb_model)
 
+        tgt_map = {"en": "eng_Latn", "hi": "hin_Deva", "es": "spa_Latn"}
+        tgt = tgt_map.get(target_lang)
+        if not tgt:
+            return text
+
+        inputs = tok(text, return_tensors="pt", truncation=True, max_length=1024)
+        forced_bos = tok.convert_tokens_to_ids(tgt)
+        out = model.generate(**inputs, forced_bos_token_id=forced_bos, max_new_tokens=512)
+        return tok.batch_decode(out, skip_special_tokens=True)[0]
+
+    # ---- Remote translate providers ----
+    if TRANSLATE_PROVIDER == "libretranslate":
+        base = (os.getenv("LIBRETRANSLATE_URL") or "").strip().rstrip("/")
+        if not base:
+            raise RuntimeError("LIBRETRANSLATE_URL not set")
+        api_key = (os.getenv("LIBRETRANSLATE_API_KEY") or "").strip()
+
+        payload = {
+            "q": text,
+            "source": "auto",
+            "target": target_lang,
+            "format": "text",
+        }
+        if api_key:
+            payload["api_key"] = api_key
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url=f"{base}/translate",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        out = json.loads(body)
+        return (out.get("translatedText") or "").strip()
+
+    # Default: google_free
+    q = urllib.parse.quote(text)
+    url = (
+        "https://translate.googleapis.com/translate_a/single"
+        f"?client=gtx&sl=auto&tl={urllib.parse.quote(target_lang)}&dt=t&q={q}"
+    )
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+    arr = json.loads(raw)
+    # arr[0] = list of translated chunks
+    translated = "".join([chunk[0] for chunk in arr[0] if chunk and chunk[0]])
+    return translated.strip()
 
 def tts_speak(text: str, lang: str, out_wav: Path) -> None:
     """
@@ -1020,7 +1089,7 @@ def process_dub(job_id: str, lang: str) -> None:
             if lang == "en":
                 translated = src_text
             else:
-                translated = nllb_translate(src_text, lang)
+                translated = translate_text(src_text, lang)
 
             if not translated.strip():
                 raise RuntimeError("translation empty")
