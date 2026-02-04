@@ -864,9 +864,7 @@ def translate_text(text: str, target_lang: str) -> str:
 
 def tts_speak(text: str, lang: str, out_wav: Path) -> None:
     out_wav.parent.mkdir(parents=True, exist_ok=True)
-
-    text = (text or "").strip()
-    if not text:
+    if not text.strip():
         raise RuntimeError("TTS text empty")
 
     if not DISABLE_XTTS:
@@ -874,24 +872,19 @@ def tts_speak(text: str, lang: str, out_wav: Path) -> None:
         tts.tts_to_file(text=text, file_path=str(out_wav), language=lang)
         return
 
-    # Free-tier fallback: ffmpeg flite synth.
     ffmpeg_bin = require_bin("ffmpeg")
 
-    # Prevent shell/ffmpeg filter injection by escaping single quotes.
-    safe_text = text.replace("\n", " ").replace("'", "\\'").strip()
-    safe_text = _truncate(safe_text, 800)  # keep flite input small
+    # write to a temp text file so quoting never breaks
+    txt = out_wav.parent / "tts.txt"
+    txt.write_text(text.replace("\n", " ").strip(), encoding="utf-8")
 
     cmd = [
         ffmpeg_bin,
         "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        f"flite=text='{safe_text}':voice=slt",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
+        "-f", "lavfi",
+        "-i", f"flite=textfile='{txt}':voice=slt",
+        "-ac", "1",
+        "-ar", "16000",
         str(out_wav),
     ]
     rc, out = run_cmd(cmd, cwd=None)
@@ -899,29 +892,42 @@ def tts_speak(text: str, lang: str, out_wav: Path) -> None:
         tail = "\n".join(out.splitlines()[-200:])
         raise RuntimeError(f"ffmpeg flite TTS failed (rc={rc})\n{tail}")
 
-def mux_audio_into_video(ffmpeg_bin: str, video_in: Path, audio_in: Path, video_out: Path) -> None:
+def mux_audio_into_video(ffmpeg_bin: str, video_in: Path, audio_in: Path, video_out: Path, log_fn=None) -> None:
     video_out.parent.mkdir(parents=True, exist_ok=True)
+
+    # More reliable than -c:v copy on random YouTube MP4s.
     cmd = [
         ffmpeg_bin,
         "-y",
-        "-i",
-        str(video_in),
-        "-i",
-        str(audio_in),
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
+        "-i", str(video_in),
+        "-i", str(audio_in),
+
+        # ensure we pick the first video stream and first audio stream
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+
+        # re-encode video for compatibility and to avoid broken moov/stream copy issues
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+
+        # encode audio
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ac", "2",
         "-shortest",
+
+        # make the mp4 start fast and be more compatible
+        "-movflags", "+faststart",
         str(video_out),
     ]
+
     rc, out = run_cmd(cmd, cwd=None)
+    if log_fn:
+        log_fn("== ffmpeg mux ==")
+        for line in out.splitlines()[-200:]:
+            log_fn(line)
+
     if rc != 0:
         tail = "\n".join(out.splitlines()[-200:])
         raise RuntimeError(f"ffmpeg mux failed (rc={rc})\n{tail}")
@@ -1039,7 +1045,8 @@ def process_dub(job_id: str, lang: str) -> None:
             if not out_audio.exists() or out_audio.stat().st_size < 2048:
                 raise RuntimeError("dub audio not generated")
 
-            mux_audio_into_video(ffmpeg_bin, video_in, out_audio, out_video)
+            mux_audio_into_video(ffmpeg_bin, video_in, out_audio, out_video, log_fn=log)
+
             if not out_video.exists() or out_video.stat().st_size < 10_000:
                 raise RuntimeError("dub video not generated")
 
