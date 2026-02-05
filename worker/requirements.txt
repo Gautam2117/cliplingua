@@ -10,3 +10,4 @@ ctranslate2==4.7.0
 
 numpy==1.26.4
 requests==2.32.3
+edge-tts==6.1.11

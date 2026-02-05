@@ -862,9 +862,54 @@ def translate_text(text: str, target_lang: str) -> str:
     translated = "".join([chunk[0] for chunk in arr[0] if chunk and chunk[0]])
     return translated.strip()
 
-def tts_speak(text: str, lang: str, out_wav: Path) -> None:
+import asyncio
+
+def _edge_voice_for(lang: str) -> str:
+    # Good defaults; tweak later
+    return {
+        "hi": os.getenv("EDGE_TTS_VOICE_HI", "hi-IN-SwaraNeural"),
+        "en": os.getenv("EDGE_TTS_VOICE_EN", "en-IN-NeerjaNeural"),
+        "es": os.getenv("EDGE_TTS_VOICE_ES", "es-ES-ElviraNeural"),
+    }.get(lang, "en-IN-NeerjaNeural")
+
+async def _edge_tts_async(text: str, lang: str, out_wav: Path) -> None:
+    import edge_tts  # pip package name: edge-tts
+
     out_wav.parent.mkdir(parents=True, exist_ok=True)
-    if not text.strip():
+
+    voice = _edge_voice_for(lang)
+    rate = os.getenv("EDGE_TTS_RATE", "+0%")
+    volume = os.getenv("EDGE_TTS_VOLUME", "+0%")
+
+    # Write MP3 (edge-tts output), then convert to WAV 16k mono
+    tmp_mp3 = out_wav.with_suffix(".mp3")
+    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, volume=volume)
+    await communicate.save(str(tmp_mp3))
+
+    if not tmp_mp3.exists() or tmp_mp3.stat().st_size < 1024:
+        raise RuntimeError("edge-tts produced empty audio")
+
+    ffmpeg_bin = require_bin("ffmpeg")
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", str(tmp_mp3),
+        "-ac", "1",
+        "-ar", "16000",
+        str(out_wav),
+    ]
+    rc, out = run_cmd(cmd, cwd=None)
+    tmp_mp3.unlink(missing_ok=True)
+    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
+        tail = "\n".join(out.splitlines()[-200:])
+        raise RuntimeError(f"ffmpeg convert failed (rc={rc})\n{tail}")
+
+def tts_speak(text: str, lang: str, out_wav: Path) -> None:
+    """
+    - If XTTS enabled: use Coqui XTTS (heavy)
+    - Else: use edge-tts (light + real voices for hi/en/es)
+    """
+    text = (text or "").strip()
+    if not text:
         raise RuntimeError("TTS text empty")
 
     if not DISABLE_XTTS:
@@ -872,62 +917,32 @@ def tts_speak(text: str, lang: str, out_wav: Path) -> None:
         tts.tts_to_file(text=text, file_path=str(out_wav), language=lang)
         return
 
-    ffmpeg_bin = require_bin("ffmpeg")
+    # edge-tts fallback
+    try:
+        asyncio.run(_edge_tts_async(text, lang, out_wav))
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"edge-tts failed: {e}")
 
-    # write to a temp text file so quoting never breaks
-    txt = out_wav.parent / "tts.txt"
-    txt.write_text(text.replace("\n", " ").strip(), encoding="utf-8")
-
-    cmd = [
-        ffmpeg_bin,
-        "-y",
-        "-f", "lavfi",
-        "-i", f"flite=textfile='{txt}':voice=slt",
-        "-ac", "1",
-        "-ar", "16000",
-        str(out_wav),
-    ]
-    rc, out = run_cmd(cmd, cwd=None)
-    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
-        tail = "\n".join(out.splitlines()[-200:])
-        raise RuntimeError(f"ffmpeg flite TTS failed (rc={rc})\n{tail}")
-
-def mux_audio_into_video(ffmpeg_bin: str, video_in: Path, audio_in: Path, video_out: Path, log_fn=None) -> None:
+def mux_audio_into_video(ffmpeg_bin: str, video_in: Path, audio_in: Path, video_out: Path) -> None:
     video_out.parent.mkdir(parents=True, exist_ok=True)
-
-    # More reliable than -c:v copy on random YouTube MP4s.
     cmd = [
         ffmpeg_bin,
         "-y",
         "-i", str(video_in),
+        "-stream_loop", "-1",
         "-i", str(audio_in),
-
-        # ensure we pick the first video stream and first audio stream
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-
-        # re-encode video for compatibility and to avoid broken moov/stream copy issues
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-
-        # encode audio
+        "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "128k",
-        "-ac", "2",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-t", "999999",   # will be clipped by -shortest relative to video if we use -shortest
         "-shortest",
-
-        # make the mp4 start fast and be more compatible
-        "-movflags", "+faststart",
         str(video_out),
     ]
-
     rc, out = run_cmd(cmd, cwd=None)
-    if log_fn:
-        log_fn("== ffmpeg mux ==")
-        for line in out.splitlines()[-200:]:
-            log_fn(line)
-
     if rc != 0:
         tail = "\n".join(out.splitlines()[-200:])
         raise RuntimeError(f"ffmpeg mux failed (rc={rc})\n{tail}")
