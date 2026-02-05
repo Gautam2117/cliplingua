@@ -1158,6 +1158,8 @@ def debug_binaries():
         "yt_dlp": shutil.which("yt-dlp"),
         "ffmpeg": shutil.which("ffmpeg"),
         "node": shutil.which("node"),
+        "espeak_ng": shutil.which("espeak-ng"),
+        "espeak": shutil.which("espeak"),
         "DATA_DIR": str(DATA_DIR.resolve()),
         "TMP_DIR": str(TMP_DIR.resolve()),
         "JOB_STORE_DIR": str(JOB_STORE_DIR.resolve()),
