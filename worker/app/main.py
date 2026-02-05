@@ -330,7 +330,10 @@ def sb_get_log(job_id: str) -> Optional[str]:
         res = _supabase.table("clip_jobs").select("log_text").eq("id", job_id).limit(1).execute()
         data = getattr(res, "data", None)
         if data and isinstance(data, list) and len(data) > 0:
-            return data[0].get("log_text") or ""
+            txt = data[0].get("log_text")
+            if not txt or not str(txt).strip():
+                return None
+            return txt
         return None
     except Exception:
         return None
@@ -1205,6 +1208,8 @@ def create_job(body: CreateJobBody):
     }
     save_job_local(job_id, payload)
     sb_upsert_job(job_id, payload)
+    sb_append_log(job_id, f"spawned job runner at {now_iso()} url={body.url}\n")
+
 
     env = os.environ.copy()
     env["CLIPLINGUA_JOB_ID"] = job_id
@@ -1218,14 +1223,14 @@ def create_job(body: CreateJobBody):
     )
 
     log_f = open(paths["runner_log"], "a", encoding="utf-8")
-    subprocess.Popen(
-        [sys.executable, "-u", "-c", runner],
-        cwd=str(PROJECT_ROOT),
-        stdout=log_f,
-        stderr=log_f,
-        env=env,
-        start_new_session=True,
-    )
+    import threading
+
+    threading.Thread(
+        target=process_job,
+        args=(job_id, str(body.url)),
+        daemon=True,
+    ).start()
+
 
     return {"jobId": job_id}
 
@@ -1314,14 +1319,14 @@ def dub_job(job_id: str, body: DubBody):
     dd.mkdir(parents=True, exist_ok=True)
 
     runner_log_f = open(dub_runner_log_path(job_id, lang), "a", encoding="utf-8")
-    subprocess.Popen(
-        [sys.executable, "-u", "-c", runner],
-        cwd=str(PROJECT_ROOT),
-        stdout=runner_log_f,
-        stderr=runner_log_f,
-        env=env,
-        start_new_session=True,
-    )
+    import threading
+
+    threading.Thread(
+        target=process_dub,
+        args=(job_id, lang),
+        daemon=True,
+    ).start()
+
 
     return {
         "ok": True,
