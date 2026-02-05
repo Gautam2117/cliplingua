@@ -6,7 +6,8 @@ ENV PYTHONUNBUFFERED=1 \
     TMP_DIR=/tmp/cliplingua/tmp
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg ca-certificates git curl tini \
+    ffmpeg ca-certificates git curl tini nodejs \
+    espeak-ng \
     libsndfile1 libgomp1 \
   && rm -rf /var/lib/apt/lists/*
 

@@ -903,29 +903,57 @@ async def _edge_tts_async(text: str, lang: str, out_wav: Path) -> None:
         tail = "\n".join(out.splitlines()[-200:])
         raise RuntimeError(f"ffmpeg convert failed (rc={rc})\n{tail}")
 
+def _espeak_voice_for(lang: str) -> str:
+    return {"hi": "hi", "en": "en-us", "es": "es"}.get(lang, "en-us")
+
+def tts_espeak(text: str, lang: str, out_wav: Path) -> None:
+    voice = _espeak_voice_for(lang)
+    tmp = out_wav.with_suffix(".espeak.wav")
+
+    cmd = ["espeak-ng", "-v", voice, "-w", str(tmp), "--stdin"]
+    proc = subprocess.run(cmd, input=text, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"espeak-ng failed (rc={proc.returncode})\n{proc.stdout[-2000:]}")
+
+    ffmpeg_bin = require_bin("ffmpeg")
+    rc, out = run_cmd([ffmpeg_bin, "-y", "-i", str(tmp), "-ac", "1", "-ar", "16000", str(out_wav)], cwd=None)
+    tmp.unlink(missing_ok=True)
+    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
+        raise RuntimeError(f"ffmpeg convert failed (rc={rc})\n{out.splitlines()[-200:]}")
+
 def tts_speak(text: str, lang: str, out_wav: Path) -> None:
-    """
-    - If XTTS enabled: use Coqui XTTS (heavy)
-    - Else: use edge-tts (light + real voices for hi/en/es)
-    """
     text = (text or "").strip()
     if not text:
         raise RuntimeError("TTS text empty")
 
-    if not DISABLE_XTTS:
-        tts = _get_xtts()
-        tts.tts_to_file(text=text, file_path=str(out_wav), language=lang)
-        return
+    provider = (os.getenv("TTS_PROVIDER") or "auto").strip().lower()
 
-    # edge-tts fallback
-    try:
+    def try_edge():
         asyncio.run(_edge_tts_async(text, lang, out_wav))
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"edge-tts failed: {e}")
 
-def mux_audio_into_video(ffmpeg_bin: str, video_in: Path, audio_in: Path, video_out: Path) -> None:
+    def try_espeak():
+        tts_espeak(text, lang, out_wav)
+
+    attempts = []
+    if provider == "edge":
+        attempts = [("edge", try_edge)]
+    elif provider == "espeak":
+        attempts = [("espeak", try_espeak)]
+    else:
+        # auto: try edge (nice voice) then espeak (always works)
+        attempts = [("edge", try_edge), ("espeak", try_espeak)]
+
+    last = None
+    for name, fn in attempts:
+        try:
+            fn()
+            return
+        except Exception as e:
+            last = f"{name}: {e}"
+
+    raise RuntimeError(f"TTS failed: {last}")
+
+def mux_audio_into_video(ffmpeg_bin: str, video_in: Path, audio_in: Path, video_out: Path, log_fn=None) -> None:
     video_out.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         ffmpeg_bin,
@@ -943,6 +971,9 @@ def mux_audio_into_video(ffmpeg_bin: str, video_in: Path, audio_in: Path, video_
         str(video_out),
     ]
     rc, out = run_cmd(cmd, cwd=None)
+    if log_fn:
+        log_fn("== ffmpeg mux ==")
+        log_fn(out)
     if rc != 0:
         tail = "\n".join(out.splitlines()[-200:])
         raise RuntimeError(f"ffmpeg mux failed (rc={rc})\n{tail}")
