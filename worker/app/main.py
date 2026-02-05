@@ -156,8 +156,9 @@ def sb_upload_file(job_id: str, local_path: Path, filename: str, content_type: s
                 file_options={
                     "cache-control": "3600",
                     "content-type": content_type,
-                    "upsert": True,
+                    "upsert": "true",   # IMPORTANT: must be string, not bool
                 },
+
             )
         return key
     except Exception as e:
