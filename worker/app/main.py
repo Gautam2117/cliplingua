@@ -1008,12 +1008,17 @@ def process_dub(job_id: str, lang: str) -> None:
         with open(local_log_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
         sb_append_dub_log(job_id, lang, line)
-        # heartbeat while running
+
+    def heartbeat() -> None:
+        # only heartbeat while running
         sb_upsert_dub_status(job_id, lang, "running", error=None)
+
 
     try:
         write_dub_status(job_id, lang, "running")
         log("== DUB START ==")
+        heartbeat()
+
         log(f"models: whisper={WHISPER_MODEL} nllb={NLLB_MODEL} xtts_disabled={DISABLE_XTTS} translate={TRANSLATE_PROVIDER} local_nllb={ENABLE_LOCAL_NLLB}")
 
         job = load_job_for_artifacts(job_id)
@@ -1033,11 +1038,15 @@ def process_dub(job_id: str, lang: str) -> None:
             tr = whisper_transcribe(audio_in)
             src_text = tr.get("text", "")
             log(f"transcribed_chars={len(src_text)}")
+            heartbeat()
+
             if not src_text.strip():
                 raise RuntimeError("transcription empty")
 
             translated = src_text if lang == "en" else translate_text(src_text, lang)
             log(f"translated_chars={len(translated)}")
+            heartbeat()
+
             if not translated.strip():
                 raise RuntimeError("translation empty")
 
