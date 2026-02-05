@@ -56,6 +56,7 @@ load_dotenv()
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
+app = FastAPI()
 
 TRANSLATE_PROVIDER = (os.getenv("TRANSLATE_PROVIDER") or "google_free").strip().lower()
 ENABLE_LOCAL_NLLB = (os.getenv("ENABLE_LOCAL_NLLB") or "").strip().lower() in {"1", "true", "yes"}
