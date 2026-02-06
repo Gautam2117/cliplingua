@@ -1,4 +1,3 @@
-// src/components/JobClient.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -17,17 +16,14 @@ type Job = {
   status: JobStatus;
   error: string | null;
 
-  // worker-side paths
   video_path: string | null;
   audio_path: string | null;
   log_path: string | null;
 
-  // worker-side public URLs (optional)
   video_url?: string | null;
   audio_url?: string | null;
   log_url?: string | null;
 
-  // worker dub status (optional)
   dub_status?: Record<string, { status?: string; error?: string | null } | string>;
 
   created_at: string;
@@ -51,7 +47,7 @@ function readDubStatus(job: Job | null, lang: string): DubState {
   if (!raw) return { status: "not_started" };
 
   if (typeof raw === "string") {
-    const s = raw as string;
+    const s = raw;
     if (s === "done" || s === "running" || s === "error") return { status: s };
     return { status: "running" };
   }
@@ -82,12 +78,12 @@ export default function JobClient({
   const [selectedLang, setSelectedLang] = useState<(typeof LANGS)[number]["code"]>("hi");
   const [dubBusy, setDubBusy] = useState(false);
 
-  const pollTimer = useRef<number | null>(null);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const canSubmit = useMemo(() => ytUrl.trim().length > 0 && !busy, [ytUrl, busy]);
 
   function clearPoll() {
-    if (pollTimer.current) window.clearTimeout(pollTimer.current);
+    if (pollTimer.current) clearTimeout(pollTimer.current);
     pollTimer.current = null;
   }
 
@@ -123,7 +119,7 @@ export default function JobClient({
       try {
         data = text ? JSON.parse(text) : {};
       } catch {
-        // keep as {}
+        // ignore
       }
 
       if (!res.ok) {
@@ -150,7 +146,7 @@ export default function JobClient({
     if (!token) {
       setMsg("Session expired. Please sign in again.");
       setBusy(false);
-      return;
+      return null;
     }
 
     const res = await fetch(`/api/clip/status?jobId=${encodeURIComponent(id)}`, {
@@ -177,11 +173,12 @@ export default function JobClient({
   useEffect(() => {
     if (!jobId) return;
 
+    const id = jobId; // IMPORTANT: capture non-null id for TS and runtime
     let alive = true;
 
     async function loop() {
       try {
-        const data = await pollOnce(jobId);
+        const data = await pollOnce(id);
         if (!alive || !data) return;
 
         setJob(data);
@@ -200,7 +197,7 @@ export default function JobClient({
           return;
         }
 
-        pollTimer.current = window.setTimeout(loop, 2000);
+        pollTimer.current = setTimeout(loop, 2000);
       } catch (e: any) {
         if (!alive) return;
         setMsg(e?.message || "Polling failed");
@@ -296,10 +293,12 @@ export default function JobClient({
       setMsg(`Dub started for ${lang.toUpperCase()}.`);
       onCreditsChanged?.();
 
-      // kick a quicker poll cycle
+      // Ensure polling continues (and restarts quickly)
       setBusy(true);
       clearPoll();
-      // poll effect will continue
+      pollTimer.current = setTimeout(() => {
+        // no-op, effect loop will keep polling
+      }, 0);
     } catch (e: any) {
       setMsg(e?.message || "Dub start failed");
     } finally {
@@ -309,7 +308,7 @@ export default function JobClient({
 
   async function downloadDub(kind: "video" | "audio" | "log") {
     if (!jobId) return;
-    const type = (`dub_${kind}` as DubArtifactType);
+    const type = `dub_${kind}` as DubArtifactType;
 
     setMsg(null);
     setDownloading(type);
