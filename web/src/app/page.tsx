@@ -1,3 +1,4 @@
+// src/app/page.tsx
 "use client";
 
 import { useEffect } from "react";
@@ -32,7 +33,7 @@ export default function Home() {
         </h1>
 
         <p className="mt-4 text-lg opacity-80">
-          Paste a YouTube link. We download, extract audio, and generate artifacts.
+          Paste a YouTube link. We download, extract audio, generate artifacts, and can dub into supported languages.
         </p>
 
         <div className="mt-8">

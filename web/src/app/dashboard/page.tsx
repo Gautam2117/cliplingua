@@ -1,3 +1,4 @@
+// src/app/dashboard/page.tsx
 "use client";
 
 import { useEffect, useState } from "react";
@@ -25,96 +26,78 @@ export default function DashboardPage() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [jobs, setJobs] = useState<JobRow[]>([]);
   const [msg, setMsg] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
   async function load() {
     setMsg(null);
+    setLoading(true);
 
-    const { data: sess } = await supabase.auth.getSession();
-    if (!sess.session) {
-      router.replace("/login");
-      return;
-    }
-
-    const { data: userData, error: userErr } = await supabase.auth.getUser();
-    if (userErr || !userData.user) {
-      router.replace("/login");
-      return;
-    }
-
-    const uid = userData.user.id;
-
-    const { data: prof, error: profErr } = await supabase
-      .from("profiles")
-      .select("id,email,credits")
-      .eq("id", uid)
-      .single();
-
-    if (profErr) {
-      setMsg(profErr.message);
-      return;
-    }
-
-    setProfile(prof as any);
-
-    const { data: jobRows, error: jobsErr } = await supabase
-      .from("user_jobs")
-      .select("id,youtube_url,worker_job_id,status,credits_spent,created_at")
-      .order("created_at", { ascending: false })
-      .limit(20);
-
-    if (jobsErr) {
-      setMsg(jobsErr.message);
-      return;
-    }
-
-    setJobs((jobRows || []) as any);
-
-    // Best-effort: sync status from worker for recent jobs
     try {
-    const workerBase =
-        process.env.NEXT_PUBLIC_WORKER_BASE_URL ||
-        process.env.NEXT_PUBLIC_WORKER_URL ||
-        "";
+      const { data: sess } = await supabase.auth.getSession();
+      if (!sess.session) {
+        router.replace("/login");
+        return;
+      }
 
-    // If you don't have NEXT_PUBLIC_WORKER_BASE_URL set, skip syncing
-    if (workerBase) {
-        const base = workerBase.replace(/\/+$/, "");
+      const { data: userData, error: userErr } = await supabase.auth.getUser();
+      if (userErr || !userData.user) {
+        router.replace("/login");
+        return;
+      }
 
-        const updates: { worker_job_id: string; status: string }[] = [];
+      const uid = userData.user.id;
 
+      const { data: prof, error: profErr } = await supabase
+        .from("profiles")
+        .select("id,email,credits")
+        .eq("id", uid)
+        .single();
+
+      if (profErr) {
+        setMsg(profErr.message);
+        return;
+      }
+      setProfile(prof as any);
+
+      const { data: jobRows, error: jobsErr } = await supabase
+        .from("user_jobs")
+        .select("id,youtube_url,worker_job_id,status,credits_spent,created_at")
+        .order("created_at", { ascending: false })
+        .limit(20);
+
+      if (jobsErr) {
+        setMsg(jobsErr.message);
+        return;
+      }
+      setJobs((jobRows || []) as any);
+
+      // Optional: status sync is now handled by /api/clip/status which also updates DB.
+      // If you still want best-effort refresh, keep it minimal and authenticated.
+      try {
+        const token = sess.session.access_token;
         for (const j of jobRows || []) {
-        const wid = (j as any).worker_job_id as string;
-        const r = await fetch(`${base}/jobs/${encodeURIComponent(wid)}`, { cache: "no-store" });
-        if (!r.ok) continue;
-        const wj = await r.json();
-        if (typeof wj?.status === "string" && wj.status !== (j as any).status) {
-            updates.push({ worker_job_id: wid, status: wj.status });
-        }
+          const wid = (j as any).worker_job_id as string;
+          await fetch(`/api/clip/status?jobId=${encodeURIComponent(wid)}`, {
+            cache: "no-store",
+            headers: { Authorization: `Bearer ${token}` },
+          }).catch(() => {});
         }
 
-        // Apply updates in DB (RLS ensures only your rows)
-        for (const u2 of updates) {
-        await supabase
-            .from("user_jobs")
-            .update({ status: u2.status })
-            .eq("worker_job_id", u2.worker_job_id);
-        }
-
-        // Re-fetch after update for correct UI
-        if (updates.length > 0) {
         const { data: fresh } = await supabase
-            .from("user_jobs")
-            .select("id,youtube_url,worker_job_id,status,credits_spent,created_at")
-            .order("created_at", { ascending: false })
-            .limit(20);
+          .from("user_jobs")
+          .select("id,youtube_url,worker_job_id,status,credits_spent,created_at")
+          .order("created_at", { ascending: false })
+          .limit(20);
 
         if (fresh) setJobs(fresh as any);
-        }
+      } catch {
+        // ignore
+      }
+    } catch (e: any) {
+      setMsg(e?.message || "Failed to load dashboard");
+    } finally {
+      setLoading(false);
     }
-    } catch {
-    // ignore sync errors
-    }
-
   }
 
   useEffect(() => {
@@ -134,7 +117,7 @@ export default function DashboardPage() {
           <div>
             <h1 className="text-3xl font-bold">Dashboard</h1>
             <p className="text-sm opacity-70 mt-1">
-              {profile ? `Credits: ${profile.credits}` : "Loading..."}
+              {profile ? `Credits: ${profile.credits}` : loading ? "Loading..." : " "}
             </p>
           </div>
 
@@ -145,11 +128,12 @@ export default function DashboardPage() {
 
         <div className="mt-8 border rounded-xl p-6">
           <h2 className="text-lg font-semibold">Create a job</h2>
-          <p className="text-sm opacity-70 mt-1">
-            Each job costs 1 credit for now.
-          </p>
+          <p className="text-sm opacity-70 mt-1">Each job costs 1 credit for now.</p>
           <div className="mt-4">
-            <JobClient onJobCreated={load} onCreditsChanged={load} />
+            <JobClient
+              onJobCreated={load}
+              onCreditsChanged={load}
+            />
           </div>
         </div>
 
