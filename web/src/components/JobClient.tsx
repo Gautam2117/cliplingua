@@ -19,16 +19,11 @@ type Job = {
   audio_url?: string | null;
   log_url?: string | null;
 
-  // worker dub status (optional)
+  // Worker adds this for dubs
   dub_status?: Record<string, { status?: string; error?: string | null } | string>;
 
   created_at: string;
   updated_at: string;
-};
-
-type DubState = {
-  status: "not_started" | "running" | "done" | "error";
-  error?: string | null;
 };
 
 type BaseArtifactType = "video" | "audio" | "log";
@@ -41,34 +36,35 @@ const LANGS = [
   { code: "es", label: "Spanish" },
 ] as const;
 
-function normalizeOneDub(raw: any): DubState {
+type DubState = { status: "not_started" | "running" | "done" | "error"; error?: string | null };
+
+function readDubState(job: Job | null, lang: string): DubState {
+  const raw = job?.dub_status?.[lang];
   if (!raw) return { status: "not_started" };
 
   if (typeof raw === "string") {
-    if (raw === "done" || raw === "running" || raw === "error") return { status: raw };
+    const s = raw;
+    if (s === "done" || s === "running" || s === "error") return { status: s };
     return { status: "running" };
   }
 
-  const s = String(raw?.status || "running");
-  const e = raw?.error ?? null;
-
+  const s = String((raw as any)?.status || "running");
+  const e = (raw as any)?.error ?? null;
   if (s === "done" || s === "running" || s === "error") return { status: s, error: e };
   return { status: "running", error: e };
-}
-
-function readDubStatus(job: Job | null, lang: string): DubState {
-  const raw = (job?.dub_status as any)?.[lang];
-  return normalizeOneDub(raw);
 }
 
 function anyDubRunning(job: Job | null): boolean {
   const ds = job?.dub_status;
   if (!ds) return false;
-
-  return Object.values(ds).some((raw) => {
-    const s = normalizeOneDub(raw).status;
-    return s === "running";
-  });
+  for (const v of Object.values(ds)) {
+    if (typeof v === "string") {
+      if (v === "running") return true;
+    } else if (v && typeof v === "object") {
+      if ((v as any).status === "running") return true;
+    }
+  }
+  return false;
 }
 
 export default function JobClient({
@@ -90,19 +86,19 @@ export default function JobClient({
   const [selectedLang, setSelectedLang] = useState<(typeof LANGS)[number]["code"]>("hi");
   const [dubBusy, setDubBusy] = useState(false);
 
-  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pollActiveRef = useRef(false);
+  // Which lang we most recently started, so we keep polling after base job is done
+  const [activeDubLang, setActiveDubLang] = useState<string | null>(null);
+
+  // force restart polling loop even if jobId doesn't change (ex: start dub)
+  const [pollKey, setPollKey] = useState(0);
+
+  const timerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
 
   const canSubmit = useMemo(() => ytUrl.trim().length > 0 && !busy, [ytUrl, busy]);
 
-  function clearPoll() {
-    if (pollTimer.current) clearTimeout(pollTimer.current);
-    pollTimer.current = null;
-  }
-
-  function stopPolling() {
-    pollActiveRef.current = false;
-    clearPoll();
+  function clearTimer() {
+    if (timerRef.current) window.clearTimeout(timerRef.current);
+    timerRef.current = null;
   }
 
   async function getAccessToken(): Promise<string | null> {
@@ -110,36 +106,13 @@ export default function JobClient({
     return data.session?.access_token ?? null;
   }
 
-  async function pollOnce(id: string): Promise<Job | null> {
-    const token = await getAccessToken();
-    if (!token) return null;
-
-    const res = await fetch(`/api/clip/status?jobId=${encodeURIComponent(id)}`, {
-      cache: "no-store",
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    const text = await res.text();
-    let data: any = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {}
-
-    if (!res.ok) {
-      const errMsg = data?.error || text || `Request failed (${res.status})`;
-      throw new Error(errMsg);
-    }
-
-    return data as Job;
-  }
-
   async function createJob() {
     setMsg(null);
     setBusy(true);
-    setDubBusy(false);
     setJob(null);
     setJobId(null);
-    stopPolling();
+    setActiveDubLang(null);
+    clearTimer();
 
     try {
       const token = await getAccessToken();
@@ -162,8 +135,7 @@ export default function JobClient({
       } catch {}
 
       if (!res.ok) {
-        const errMsg = data?.error || text || `Request failed (${res.status})`;
-        throw new Error(errMsg);
+        throw new Error(String(data?.error || text || `Request failed (${res.status})`));
       }
 
       const id: string | undefined = data?.jobId ?? data?.id;
@@ -179,47 +151,88 @@ export default function JobClient({
     }
   }
 
+  async function pollOnce(id: string): Promise<Job> {
+    const token = await getAccessToken();
+    if (!token) throw new Error("Session expired. Please sign in again.");
+
+    const res = await fetch(`/api/clip/status?jobId=${encodeURIComponent(id)}`, {
+      cache: "no-store",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    const text = await res.text();
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {}
+
+    if (!res.ok) {
+      throw new Error(String(data?.error || text || `Request failed (${res.status})`));
+    }
+
+    return data as Job;
+  }
+
   useEffect(() => {
     if (!jobId) return;
 
-    const id = jobId;
+    const id = jobId; // fixes TS build errors (string | null)
     let alive = true;
-
-    pollActiveRef.current = true;
 
     async function loop() {
       try {
         const data = await pollOnce(id);
-        if (!alive || !data) return;
+        if (!alive) return;
 
         setJob(data);
 
-        // Stop only when base is done/error AND no dub is running
-        if (data.status === "error") {
+        const baseRunning = data.status === "queued" || data.status === "running";
+        const baseErrored = data.status === "error";
+
+        // Keep polling if dub is running (even when base job is done)
+        const activeLang = activeDubLang;
+        const activeLangState = activeLang ? readDubState(data, activeLang) : null;
+
+        // If active dub finished, clear it (so we can stop polling)
+        if (activeLang && activeLangState && (activeLangState.status === "done" || activeLangState.status === "error")) {
+          setActiveDubLang(null);
+        }
+
+        const dubStillRunning =
+          anyDubRunning(data) ||
+          (activeLangState?.status === "running" || activeLangState?.status === "not_started");
+
+        if (baseErrored) {
           setBusy(false);
           setMsg(data.error || "Job failed");
-          stopPolling();
+          clearTimer();
           return;
         }
 
-        if (data.status === "done" && !anyDubRunning(data)) {
+        if (!baseRunning && !dubStillRunning) {
+          // Nothing left to wait for
           setBusy(false);
-          setMsg("Done. Download artifacts below. You can also start a dub.");
-          stopPolling();
+          setMsg("Done. Download artifacts below. Start a dub to generate translated versions.");
+          clearTimer();
           return;
         }
 
-        // Otherwise keep polling (base running or dub running)
+        // Continue polling
         setBusy(true);
 
-        if (pollActiveRef.current) {
-          pollTimer.current = setTimeout(loop, 2000);
+        // Friendly status message
+        if (baseRunning) {
+          setMsg("Processing...");
+        } else if (activeLang && activeLangState?.status === "running") {
+          setMsg(`Dub running for ${activeLang.toUpperCase()}...`);
         }
+
+        timerRef.current = window.setTimeout(loop, 2000);
       } catch (e: any) {
         if (!alive) return;
-        setMsg(e?.message || "Polling failed");
         setBusy(false);
-        stopPolling();
+        setMsg(e?.message || "Polling failed");
+        clearTimer();
       }
     }
 
@@ -227,10 +240,10 @@ export default function JobClient({
 
     return () => {
       alive = false;
-      stopPolling();
+      clearTimer();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId]);
+  }, [jobId, pollKey, activeDubLang]);
 
   async function openArtifactUrl(params: { jobId: string; type: AnyArtifactType; lang?: string }) {
     const token = await getAccessToken();
@@ -253,8 +266,7 @@ export default function JobClient({
     } catch {}
 
     if (!res.ok) {
-      const errMsg = data?.error || text || `Request failed (${res.status})`;
-      throw new Error(errMsg);
+      throw new Error(String(data?.error || text || `Request failed (${res.status})`));
     }
 
     const url = String(data?.url || "").trim();
@@ -299,32 +311,15 @@ export default function JobClient({
       } catch {}
 
       if (!res.ok) {
-        const errMsg = data?.error || text || `Request failed (${res.status})`;
-        throw new Error(errMsg);
+        throw new Error(String(data?.error || text || `Request failed (${res.status})`));
       }
 
-      // Optimistic: show running immediately
-      setJob((prev) => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          dub_status: { ...(prev.dub_status || {}), [lang]: "running" },
-        };
-      });
-
+      setActiveDubLang(lang);
       setMsg(`Dub started for ${lang.toUpperCase()}.`);
       onCreditsChanged?.();
 
-      // Ensure polling continues even if base job is already done
-      pollActiveRef.current = true;
-      clearPoll();
-      pollTimer.current = setTimeout(async () => {
-        // tick ASAP
-        try {
-          const fresh = await pollOnce(jobId);
-          if (fresh) setJob(fresh);
-        } catch {}
-      }, 400);
+      // Restart polling even if base job is already done
+      setPollKey((k) => k + 1);
     } catch (e: any) {
       setMsg(e?.message || "Dub start failed");
     } finally {
@@ -348,7 +343,7 @@ export default function JobClient({
     }
   }
 
-  const dubState = readDubStatus(job, selectedLang);
+  const dubState = readDubState(job, selectedLang);
 
   return (
     <div className="w-full">

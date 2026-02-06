@@ -1,4 +1,3 @@
-// src/app/dashboard/page.tsx
 "use client";
 
 import { useEffect, useState } from "react";
@@ -26,77 +25,78 @@ export default function DashboardPage() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [jobs, setJobs] = useState<JobRow[]>([]);
   const [msg, setMsg] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+
+  async function syncRecentStatuses(token: string, rows: JobRow[]) {
+    const candidates = rows.filter((r) => r.status !== "done" && r.status !== "error").slice(0, 10);
+
+    await Promise.allSettled(
+      candidates.map(async (r) => {
+        await fetch(`/api/clip/status?jobId=${encodeURIComponent(r.worker_job_id)}`, {
+          cache: "no-store",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      })
+    );
+  }
 
   async function load() {
     setMsg(null);
-    setLoading(true);
+
+    const { data: sess } = await supabase.auth.getSession();
+    const token = sess.session?.access_token;
+
+    if (!sess.session || !token) {
+      router.replace("/login");
+      return;
+    }
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser();
+    if (userErr || !userData.user) {
+      router.replace("/login");
+      return;
+    }
+
+    const uid = userData.user.id;
+
+    const { data: prof, error: profErr } = await supabase
+      .from("profiles")
+      .select("id,email,credits")
+      .eq("id", uid)
+      .single();
+
+    if (profErr) {
+      setMsg(profErr.message);
+      return;
+    }
+
+    setProfile(prof as any);
+
+    const { data: jobRows, error: jobsErr } = await supabase
+      .from("user_jobs")
+      .select("id,youtube_url,worker_job_id,status,credits_spent,created_at")
+      .order("created_at", { ascending: false })
+      .limit(20);
+
+    if (jobsErr) {
+      setMsg(jobsErr.message);
+      return;
+    }
+
+    const rows = (jobRows || []) as any as JobRow[];
+    setJobs(rows);
 
     try {
-      const { data: sess } = await supabase.auth.getSession();
-      if (!sess.session) {
-        router.replace("/login");
-        return;
-      }
+      await syncRecentStatuses(token, rows);
 
-      const { data: userData, error: userErr } = await supabase.auth.getUser();
-      if (userErr || !userData.user) {
-        router.replace("/login");
-        return;
-      }
-
-      const uid = userData.user.id;
-
-      const { data: prof, error: profErr } = await supabase
-        .from("profiles")
-        .select("id,email,credits")
-        .eq("id", uid)
-        .single();
-
-      if (profErr) {
-        setMsg(profErr.message);
-        return;
-      }
-      setProfile(prof as any);
-
-      const { data: jobRows, error: jobsErr } = await supabase
+      const { data: fresh } = await supabase
         .from("user_jobs")
         .select("id,youtube_url,worker_job_id,status,credits_spent,created_at")
         .order("created_at", { ascending: false })
         .limit(20);
 
-      if (jobsErr) {
-        setMsg(jobsErr.message);
-        return;
-      }
-      setJobs((jobRows || []) as any);
-
-      // Optional: status sync is now handled by /api/clip/status which also updates DB.
-      // If you still want best-effort refresh, keep it minimal and authenticated.
-      try {
-        const token = sess.session.access_token;
-        for (const j of jobRows || []) {
-          const wid = (j as any).worker_job_id as string;
-          await fetch(`/api/clip/status?jobId=${encodeURIComponent(wid)}`, {
-            cache: "no-store",
-            headers: { Authorization: `Bearer ${token}` },
-          }).catch(() => {});
-        }
-
-        const { data: fresh } = await supabase
-          .from("user_jobs")
-          .select("id,youtube_url,worker_job_id,status,credits_spent,created_at")
-          .order("created_at", { ascending: false })
-          .limit(20);
-
-        if (fresh) setJobs(fresh as any);
-      } catch {
-        // ignore
-      }
-    } catch (e: any) {
-      setMsg(e?.message || "Failed to load dashboard");
-    } finally {
-      setLoading(false);
+      if (fresh) setJobs(fresh as any);
+    } catch {
+      // ignore best-effort sync
     }
   }
 
@@ -116,9 +116,7 @@ export default function DashboardPage() {
         <div className="flex items-start justify-between gap-3">
           <div>
             <h1 className="text-3xl font-bold">Dashboard</h1>
-            <p className="text-sm opacity-70 mt-1">
-              {profile ? `Credits: ${profile.credits}` : loading ? "Loading..." : " "}
-            </p>
+            <p className="text-sm opacity-70 mt-1">{profile ? `Credits: ${profile.credits}` : "Loading..."}</p>
           </div>
 
           <button onClick={signOut} className="border rounded-md px-4 py-2">
@@ -130,10 +128,7 @@ export default function DashboardPage() {
           <h2 className="text-lg font-semibold">Create a job</h2>
           <p className="text-sm opacity-70 mt-1">Each job costs 1 credit for now.</p>
           <div className="mt-4">
-            <JobClient
-              onJobCreated={load}
-              onCreditsChanged={load}
-            />
+            <JobClient onJobCreated={load} onCreditsChanged={load} />
           </div>
         </div>
 
