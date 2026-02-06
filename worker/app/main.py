@@ -30,6 +30,8 @@ import shutil
 import subprocess
 import re
 import wave
+import numpy as np
+
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 from functools import lru_cache
@@ -92,6 +94,31 @@ app = FastAPI(title="ClipLingua Worker", version="0.9.0-timed-dub")
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
+def wav_duration_seconds(path: Path) -> float:
+    with wave.open(str(path), "rb") as wf:
+        frames = wf.getnframes()
+        sr = wf.getframerate()
+    return float(frames) / float(sr) if sr else 0.0
+
+def make_silence_wav(duration_s: float, out_wav: Path) -> None:
+    duration_s = float(duration_s)
+    if duration_s <= 0.01:
+        raise RuntimeError("silence duration too small")
+
+    ffmpeg_bin = require_bin("ffmpeg")
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-f", "lavfi",
+        "-i", f"anullsrc=r=16000:cl=mono",
+        "-t", f"{duration_s:.3f}",
+        "-ar", "16000", "-ac", "1",
+        str(out_wav),
+    ]
+    rc, out = run_cmd(cmd, cwd=None)
+    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
+        tail = "\n".join(out.splitlines()[-120:])
+        raise RuntimeError(f"make_silence_wav failed (rc={rc})\n{tail}")
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -459,6 +486,92 @@ def _get_nllb():
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
+
+def _read_wav_mono(path: Path) -> Tuple[np.ndarray, int]:
+    with wave.open(str(path), "rb") as wf:
+        ch = wf.getnchannels()
+        sr = wf.getframerate()
+        n = wf.getnframes()
+        raw = wf.readframes(n)
+
+    x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if ch > 1:
+        x = x.reshape(-1, ch).mean(axis=1)
+    return x, sr
+
+def estimate_median_f0(audio_wav: Path, sr_expected: int = 16000) -> Optional[float]:
+    """
+    Lightweight pitch estimate via autocorrelation.
+    Works fine for voice and avoids heavy deps.
+    Returns median F0 in Hz or None.
+    """
+    try:
+        x, sr = _read_wav_mono(audio_wav)
+        if sr != sr_expected:
+            # your pipeline already outputs 16k mono, so normally not needed
+            sr = sr_expected
+
+        if x.size < sr * 1:
+            return None
+
+        frame_ms = 40
+        hop_ms = 10
+        frame = int(sr * frame_ms / 1000)
+        hop = int(sr * hop_ms / 1000)
+
+        f0s: List[float] = []
+
+        min_hz = 70
+        max_hz = 300
+
+        min_lag = int(sr / max_hz)
+        max_lag = int(sr / min_hz)
+
+        for i in range(0, len(x) - frame, hop):
+            w = x[i:i + frame]
+            w = w - float(w.mean())
+            energy = float(np.mean(w * w))
+            if energy < 1e-5:
+                continue
+
+            # FFT autocorr
+            n = len(w)
+            fft = np.fft.rfft(w, n=2 * n)
+            ac = np.fft.irfft(fft * np.conj(fft))[:n]
+            if ac[0] <= 0:
+                continue
+
+            seg = ac[min_lag:max_lag]
+            if seg.size <= 0:
+                continue
+
+            peak = float(np.max(seg))
+            if peak / float(ac[0]) < 0.25:
+                continue
+
+            lag = int(min_lag + int(np.argmax(seg)))
+            if lag <= 0:
+                continue
+
+            f0 = float(sr / lag)
+            if min_hz <= f0 <= max_hz:
+                f0s.append(f0)
+
+        if not f0s:
+            return None
+        return float(np.median(np.array(f0s, dtype=np.float32)))
+    except Exception:
+        return None
+
+def infer_gender_from_f0(f0_hz: Optional[float]) -> str:
+    """
+    Very simple heuristic:
+    - <= 165 Hz: likely male
+    - > 165 Hz: likely female
+    """
+    if not f0_hz:
+        return "unknown"
+    return "female" if f0_hz > 165.0 else "male"
 
 def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     proc = subprocess.run(
@@ -852,13 +965,52 @@ def translate_text(text: str, target_lang: str) -> str:
 
 import asyncio
 
-def _edge_voice_for(lang: str) -> str:
-    voices = {
-        "hi": os.getenv("EDGE_TTS_VOICE_HI", "hi-IN-SwaraNeural"),
-        "en": os.getenv("EDGE_TTS_VOICE_EN", "en-IN-NeerjaNeural"),
+def _edge_voice_for(lang: str, gender: str = "unknown") -> str:
+    """
+    gender: male | female | unknown
+    Falls back to EDGE_TTS_VOICE_* if per-gender env not provided.
+    """
+    lang = (lang or "en").lower()
+    gender = (gender or "unknown").lower()
+
+    # Per-gender env keys
+    key_map = {
+        ("hi", "male"): "EDGE_TTS_VOICE_HI_MALE",
+        ("hi", "female"): "EDGE_TTS_VOICE_HI_FEMALE",
+        ("en", "male"): "EDGE_TTS_VOICE_EN_MALE",
+        ("en", "female"): "EDGE_TTS_VOICE_EN_FEMALE",
+        ("es", "male"): "EDGE_TTS_VOICE_ES_MALE",
+        ("es", "female"): "EDGE_TTS_VOICE_ES_FEMALE",
+    }
+
+    # Fallback env keys (your existing ones)
+    fallback_env = {
+        "hi": os.getenv("EDGE_TTS_VOICE_HI", "hi-IN-MadhurNeural"),
+        "en": os.getenv("EDGE_TTS_VOICE_EN", "en-IN-PrabhatNeural"),
         "es": os.getenv("EDGE_TTS_VOICE_ES", "es-ES-ElviraNeural"),
     }
-    return voices.get(lang, "en-IN-NeerjaNeural")
+
+    # Default male/female if nothing set
+    defaults = {
+        ("hi", "male"): "hi-IN-MadhurNeural",
+        ("hi", "female"): "hi-IN-SwaraNeural",
+        ("en", "male"): "en-IN-PrabhatNeural",
+        ("en", "female"): "en-IN-NeerjaNeural",
+        ("es", "male"): "es-ES-AlvaroNeural",
+        ("es", "female"): "es-ES-ElviraNeural",
+    }
+
+    env_key = key_map.get((lang, gender))
+    if env_key:
+        v = (os.getenv(env_key) or "").strip()
+        if v:
+            return v
+
+    # If unknown gender, prefer your existing voice env
+    if gender == "unknown":
+        return fallback_env.get(lang, fallback_env["en"])
+
+    return defaults.get((lang, gender), fallback_env.get(lang, fallback_env["en"]))
 
 def _base_rate_for_lang(lang: str) -> str:
     # Keep this close to natural. Timing is handled mostly by segment fitting.
@@ -888,22 +1040,25 @@ def _safe_text_for_tts(text: str) -> str:
     text = re.sub(r"([,.;:!?])([A-Za-z])", r"\1 \2", text)
     return text.strip()
 
-async def _edge_tts_to_mp3_async(text: str, lang: str, out_mp3: Path, rate: str, volume: str, pitch: str) -> None:
+async def _edge_tts_to_mp3_async(
+    text: str, lang: str, out_mp3: Path, rate: str, volume: str, pitch: str, gender: str = "unknown"
+) -> None:
     import edge_tts
     out_mp3.parent.mkdir(parents=True, exist_ok=True)
-    voice = _edge_voice_for(lang)
+    voice = _edge_voice_for(lang, gender)
     communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, volume=volume, pitch=pitch)
     await communicate.save(str(out_mp3))
+
     if not out_mp3.exists() or out_mp3.stat().st_size < 1024:
         raise RuntimeError("edge-tts produced empty audio")
 
-def tts_edge(text: str, lang: str, out_wav: Path, rate: str, log_fn=None) -> None:
+def tts_edge(text: str, lang: str, out_wav: Path, rate: str, log_fn=None, gender: str = "unknown") -> None:
     text = _safe_text_for_tts(text)
     if not text:
         raise RuntimeError("TTS text empty")
 
     tmp_mp3 = out_wav.with_suffix(".mp3")
-    asyncio.run(_edge_tts_to_mp3_async(text, lang, tmp_mp3, rate=rate, volume=EDGE_TTS_VOLUME, pitch=EDGE_TTS_PITCH))
+    asyncio.run(_edge_tts_to_mp3_async(text, lang, tmp_mp3, rate=rate, volume=EDGE_TTS_VOLUME, pitch=EDGE_TTS_PITCH, gender=gender))
 
     ffmpeg_bin = require_bin("ffmpeg")
     cmd = [ffmpeg_bin, "-y", "-i", str(tmp_mp3), "-ac", "1", "-ar", "16000", str(out_wav)]
@@ -932,7 +1087,7 @@ def tts_espeak(text: str, lang: str, out_wav: Path) -> None:
     if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
         raise RuntimeError(f"ffmpeg convert failed (rc={rc})\n{out.splitlines()[-200:]}")
 
-def tts_speak(text: str, lang: str, out_wav: Path, log_fn=None) -> None:
+def tts_speak(text: str, lang: str, out_wav: Path, log_fn=None, gender: str = "unknown") -> None:
     """
     Non-timed fallback: sentence splitting + stitch.
     Timed dubbing uses a different path (segment-based).
@@ -955,7 +1110,7 @@ def tts_speak(text: str, lang: str, out_wav: Path, log_fn=None) -> None:
             tmp_wav = out_wav.with_suffix(f".sent{i}.wav")
 
             def try_edge():
-                tts_edge(sentence, lang, tmp_wav, rate=_base_rate_for_lang(lang), log_fn=None)
+                tts_edge(sentence, lang, tmp_wav, rate=_base_rate_for_lang(lang), log_fn=None, gender=gender)
 
             def try_espeak():
                 tts_espeak(sentence, lang, tmp_wav)
@@ -992,7 +1147,7 @@ def tts_speak(text: str, lang: str, out_wav: Path, log_fn=None) -> None:
     last = None
     if provider in {"auto", "edge"}:
         try:
-            tts_edge(text, lang, out_wav, rate=_base_rate_for_lang(lang), log_fn=None)
+            tts_edge(text, lang, out_wav, rate=_base_rate_for_lang(lang), log_fn=None, gender=gender)
             return
         except Exception as e:
             last = f"edge: {e}"
@@ -1011,12 +1166,6 @@ def tts_speak(text: str, lang: str, out_wav: Path, log_fn=None) -> None:
 # -----------------------------------------------------------------------------
 # Audio + video timing helpers
 # -----------------------------------------------------------------------------
-
-def wav_duration_seconds(p: Path) -> float:
-    with wave.open(str(p), "rb") as wf:
-        frames = wf.getnframes()
-        rate = wf.getframerate()
-        return float(frames) / float(rate) if rate else 0.0
 
 def video_duration_seconds(p: Path) -> Optional[float]:
     try:
@@ -1380,6 +1529,18 @@ def process_dub(job_id: str, lang: str) -> None:
         out_audio = dub_audio_path(job_id, lang)
         out_video = dub_video_path(job_id, lang)
 
+        mode = (os.getenv("VOICE_GENDER_MODE") or "auto").strip().lower()
+        speaker_gender = "unknown"
+        speaker_f0 = None
+
+        if mode in {"male", "female"}:
+            speaker_gender = mode
+        else:
+            speaker_f0 = estimate_median_f0(audio_in)
+            speaker_gender = infer_gender_from_f0(speaker_f0)
+
+        log(f"speaker_f0_hz={speaker_f0} speaker_gender={speaker_gender}")
+
         if out_audio.exists() and out_video.exists() and out_audio.stat().st_size > 2048 and out_video.stat().st_size > 10_000:
             log("cached=true (local dub exists)")
         else:
@@ -1396,94 +1557,85 @@ def process_dub(job_id: str, lang: str) -> None:
             if not src_text.strip():
                 raise RuntimeError("transcription empty")
 
+            merged = merge_whisper_segments(segs) if (ENABLE_TIMED_DUB and segs) else []
+            log(f"segments_merged={len(merged)}")
             # Timed path
-            if ENABLE_TIMED_DUB and segs and len(segs) <= MAX_DUB_SEGMENTS:
-                merged = merge_whisper_segments(segs)
-                log(f"segments_merged={len(merged)}")
+            if ENABLE_TIMED_DUB and merged and len(merged) <= MAX_DUB_SEGMENTS:
+
+                # Build timed audio using segment timeline + gap silence (best lip sync)
+                
                 if not merged:
                     raise RuntimeError("no usable segments after merge")
 
-                # Build per-segment audio and fit to timing window
-                fitted_wavs: List[Path] = []
+                # Optional: cap segments for speed
+                max_segments = int(os.getenv("MAX_DUB_SEGMENTS", "140"))
+                merged = merged[:max_segments]
+
+                timeline_parts: List[Path] = []
+                prev_end = 0.0
+
                 seg_tmp_dir = dd / "segs"
                 seg_tmp_dir.mkdir(parents=True, exist_ok=True)
 
-                for i, s in enumerate(merged):
-                    start = float(s["start"])
-                    end = float(s["end"])
-                    dur = max(0.06, end - start)
-                    text = (s.get("text") or "").strip()
+                log(f"building_timed_audio segments={len(merged)}")
 
-                    if not text:
+                for idx, s in enumerate(merged):
+                    start = float(s.get("start", 0.0))
+                    end = float(s.get("end", 0.0))
+                    seg_text = (s.get("text") or "").strip()
+                    dur = max(0.06, end - start)
+
+                    if not seg_text:
                         continue
 
                     heartbeat()
 
-                    # Translate per segment (timing needs boundaries)
-                    tgt_text = text if lang == "en" else translate_text(text, lang)
-                    tgt_text = (tgt_text or "").strip()
-                    if not tgt_text:
-                        continue
+                    # Insert gap silence so we respect original timing
+                    gap = start - prev_end
+                    if gap > 0.02:
+                        sil = seg_tmp_dir / f"seg_{idx:04d}_gap.wav"
+                        make_silence_wav(gap, sil)
+                        timeline_parts.append(sil)
 
-                    base_rate = _base_rate_for_lang(lang)
-                    rates = _rate_candidates(base_rate)
+                    # Translate per segment (keeps boundaries aligned)
+                    seg_tr = seg_text if lang == "en" else translate_text(seg_text, lang)
+                    seg_tr = (seg_tr or "").strip()
+                    if not seg_tr:
+                        seg_tr = seg_text  # fallback to avoid accidental silence
 
-                    raw_wav = seg_tmp_dir / f"seg_{i:04d}.raw.wav"
-                    fit_wav = seg_tmp_dir / f"seg_{i:04d}.fit.wav"
+                    seg_raw = seg_tmp_dir / f"seg_{idx:04d}_raw.wav"
+                    seg_fit = seg_tmp_dir / f"seg_{idx:04d}_fit.wav"
 
-                    # Generate TTS and ensure it fits, retry with faster rate if needed
-                    last_err = None
-                    chosen = None
-                    chosen_d = None
+                    # TTS per segment with gender-aware voice
+                    voice = _edge_voice_for(lang, speaker_gender)
+                    log(f"seg={idx} dur={dur:.2f}s gender={speaker_gender} voice={voice} text={seg_tr[:60]}")
 
-                    for r in rates:
-                        try:
-                            # Always regenerate into raw_wav for each try
-                            if raw_wav.exists():
-                                raw_wav.unlink(missing_ok=True)
+                    # Generate raw segment audio
+                    provider = (os.getenv("TTS_PROVIDER") or "auto").strip().lower()
+                    if provider in {"auto", "edge"}:
+                        tts_edge(seg_tr, lang, seg_raw, rate=_base_rate_for_lang(lang), log_fn=None, gender=speaker_gender)
+                    else:
+                        tts_espeak(seg_tr, lang, seg_raw)
 
-                            provider = (os.getenv("TTS_PROVIDER") or "auto").strip().lower()
-                            if provider in {"auto", "edge"}:
-                                tts_edge(tgt_text, lang, raw_wav, rate=r, log_fn=None)
-                            else:
-                                tts_espeak(tgt_text, lang, raw_wav)
+                    # Fit to exact segment window without slowing down (pad if short, speed up only if long)
+                    stretch_or_pad_to_duration(seg_raw, seg_fit, dur, log_fn=None)
+                    timeline_parts.append(seg_fit)
 
-                            d_raw = wav_duration_seconds(raw_wav)
-                            chosen = raw_wav
-                            chosen_d = d_raw
+                    prev_end = max(prev_end, end)
 
-                            # If already fits reasonably, stop trying
-                            if d_raw <= dur * SEGMENT_FIT_TOLERANCE:
-                                break
-                        except Exception as e:
-                            last_err = e
+                if not timeline_parts:
+                    raise RuntimeError("no timeline parts generated")
 
-                    if not chosen or not chosen.exists():
-                        raise RuntimeError(f"segment_tts_failed idx={i} err={last_err}")
-
-                    log(f"seg={i} dur_target={dur:.3f}s raw_dur={chosen_d:.3f}s")
-
-                    # Fit to exact segment duration
-                    stretch_or_pad_to_duration(chosen, fit_wav, dur, log_fn=None)
-                    fitted_wavs.append(fit_wav)
-
-                if not fitted_wavs:
-                    raise RuntimeError("no audio segments were generated")
-
-                # Concatenate all fitted segments
                 stitched = dd / "stitched.wav"
-                log(f"stitching_segments={len(fitted_wavs)}")
-                ffmpeg_concat_wavs(fitted_wavs, stitched, log_fn=None)
+                log(f"stitching_parts={len(timeline_parts)}")
+                ffmpeg_concat_wavs(timeline_parts, stitched, log_fn=None)
 
-                # Ensure final duration matches video
                 final = dd / "final.wav"
                 pad_or_trim_to_video_length(stitched, video_in, final, log_fn=None)
 
-                # Normalize for consistent loudness
                 normalize_audio(final, log_fn=log)
-
-                # Export as out_audio
                 final.replace(out_audio)
+
 
                 log("muxing_audio_into_video...")
                 mux_audio_into_video(video_in, out_audio, out_video, log_fn=log)
@@ -1499,7 +1651,7 @@ def process_dub(job_id: str, lang: str) -> None:
                 if not translated.strip():
                     raise RuntimeError("translation empty")
 
-                tts_speak(translated, lang, out_audio, log_fn=log)
+                tts_speak(translated, lang, out_audio, log_fn=log, gender=speaker_gender)
                 if not out_audio.exists() or out_audio.stat().st_size < 2048:
                     raise RuntimeError("dub audio not generated")
 
