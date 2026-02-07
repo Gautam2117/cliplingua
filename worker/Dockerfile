@@ -4,12 +4,25 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DATA_DIR=/var/lib/cliplingua \
-    TMP_DIR=/tmp/cliplingua/tmp
+    TMP_DIR=/tmp/cliplingua/tmp \
+    CAPTION_FONTS_DIR=/usr/share/fonts
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg ca-certificates git curl tini nodejs \
+    # core tools
+    ca-certificates git curl tini \
+    # media
+    ffmpeg \
+    # tts + audio deps
     espeak-ng \
     libsndfile1 libgomp1 \
+    # fonts (required to avoid boxes in Hindi captions)
+    fontconfig \
+    fonts-dejavu-core \
+    fonts-noto-core \
+    fonts-noto-extra \
+    # node (keep if your project uses it)
+    nodejs \
+  && fc-cache -f \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

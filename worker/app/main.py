@@ -131,20 +131,153 @@ def write_srt(entries: List[Dict[str, Any]], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines), encoding="utf-8", errors="ignore")
 
-CAPTION_STYLE_FORCE = {
-    "clean": "Fontname=DejaVu Sans,Fontsize=28,Outline=2,Shadow=0,MarginV=58",
-    "bold":  "Fontname=DejaVu Sans,Fontsize=30,Bold=1,Outline=3,Shadow=0,MarginV=58",
-    "boxed": "Fontname=DejaVu Sans,Fontsize=28,Outline=2,Shadow=0,BackColour=&H80000000,BorderStyle=3,MarginV=58",
-    "big":   "Fontname=DejaVu Sans,Fontsize=36,Bold=1,Outline=3,Shadow=0,MarginV=70",
+# --------------------------------------------------------------------------
+# Captions (robust fonts + autosize)
+# --------------------------------------------------------------------------
+
+def probe_video_size(video_in: Path) -> Tuple[int, int]:
+    """Return (w,h) or (1280,720) fallback."""
+    try:
+        ffprobe = require_bin("ffprobe")
+        rc, out = run_cmd(
+            [
+                ffprobe, "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+                str(video_in),
+            ],
+            cwd=None,
+        )
+        if rc != 0:
+            return (1280, 720)
+        val = out.strip().splitlines()[-1].strip()
+        if "x" in val:
+            w, h = val.split("x", 1)
+            return (int(w), int(h))
+        return (1280, 720)
+    except Exception:
+        return (1280, 720)
+
+def _font_exists(font_name: str) -> bool:
+    """Check if a font exists using fc-list when available."""
+    try:
+        fc = shutil.which("fc-list")
+        if not fc:
+            return False
+        rc, out = run_cmd([fc, ":family"], cwd=None)
+        if rc != 0:
+            return False
+        fams = out.lower()
+        return font_name.lower() in fams
+    except Exception:
+        return False
+
+CAPTION_FONT_PREFS = {
+    # Put Devanagari-capable fonts first for Hindi
+    "hi": [
+        os.getenv("CAPTION_FONT_HI", "").strip(),
+        "Noto Sans Devanagari",
+        "Lohit Devanagari",
+        "Mangal",
+        "Nirmala UI",
+        "DejaVu Sans",
+    ],
+    "en": [
+        os.getenv("CAPTION_FONT_EN", "").strip(),
+        "Noto Sans",
+        "DejaVu Sans",
+        "Arial",
+    ],
+    "es": [
+        os.getenv("CAPTION_FONT_ES", "").strip(),
+        "Noto Sans",
+        "DejaVu Sans",
+        "Arial",
+    ],
 }
 
-def burn_captions(video_in: Path, srt_path: Path, video_out: Path, caption_style: str, log_fn=None) -> None:
-    ffmpeg = require_bin("ffmpeg")
-    style = CAPTION_STYLE_FORCE.get(caption_style, CAPTION_STYLE_FORCE["clean"])
+def pick_caption_font(lang: str) -> Optional[str]:
+    lang = (lang or "en").lower()
+    prefs = CAPTION_FONT_PREFS.get(lang, CAPTION_FONT_PREFS["en"])
+    prefs = [p for p in prefs if p]  # drop empty
+    # If we can detect installed fonts, pick the first that exists.
+    for f in prefs:
+        if _font_exists(f):
+            return f
+    # If we cannot detect (fc-list missing), still return a strong default.
+    # For Hindi, prefer Noto Sans Devanagari.
+    if lang == "hi":
+        return "Noto Sans Devanagari"
+    return "Noto Sans"
 
-    # Escape path for ffmpeg subtitles filter on linux
-    p = str(srt_path).replace("\\", "/").replace(":", "\\:")
-    vf = f"subtitles='{p}':force_style='{style}'"
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+def build_caption_force_style(style_id: str, video_h: int, lang: str) -> str:
+    """
+    Auto-size based on video height but clamp so 9:16 videos do not get giant captions.
+    """
+    style_id = (style_id or "clean").lower()
+    font = pick_caption_font(lang)
+
+    # scale based on 720p baseline, but clamp for tall videos (Shorts/Reels)
+    scale = clamp(video_h / 720.0, 0.80, 1.25)
+
+    base_size = int(round(24 * scale))     # 720p ~24
+    big_size  = int(round(base_size * 1.20))
+    outline   = int(round(2 * scale))
+    outline   = max(1, min(outline, 3))
+    margin_v  = int(round(56 * scale))
+
+    # Common base: readable, not bulky
+    base = [
+        f"Fontname={font}",
+        f"Fontsize={base_size}",
+        "PrimaryColour=&H00FFFFFF",   # white
+        "OutlineColour=&H00000000",   # black
+        f"Outline={outline}",
+        "Shadow=0",
+        f"MarginV={margin_v}",
+        "Alignment=2",                # bottom-center
+        "WrapStyle=2",                # smart wrapping
+    ]
+
+    if style_id == "bold":
+        base += ["Bold=1", f"Outline={min(3, outline + 1)}"]
+    elif style_id == "boxed":
+        base += [
+            "BorderStyle=3",
+            "BackColour=&H80000000",   # 50% black
+            f"Outline={outline}",
+        ]
+    elif style_id == "big":
+        base = [x if not x.startswith("Fontsize=") else f"Fontsize={big_size}" for x in base]
+        base += ["Bold=1", f"Outline={min(3, outline + 1)}"]
+
+    return ",".join(base)
+
+def burn_captions(
+    video_in: Path,
+    srt_path: Path,
+    video_out: Path,
+    caption_style: str,
+    lang: str,
+    log_fn=None,
+) -> None:
+    ffmpeg = require_bin("ffmpeg")
+
+    # fontsdir helps libass find fonts in slim containers
+    fontsdir = (os.getenv("CAPTION_FONTS_DIR") or "/usr/share/fonts").strip()
+    _, vh = probe_video_size(video_in)
+    style = build_caption_force_style(caption_style, vh, lang)
+
+    # Escape for ffmpeg subtitles filter
+    p = str(srt_path).replace("\\", "/")
+    p = p.replace(":", "\\:").replace("'", "\\'")
+    fontsdir = fontsdir.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+    vf = f"subtitles='{p}':charenc=UTF-8:fontsdir='{fontsdir}':force_style='{style}'"
 
     cmd = [
         ffmpeg, "-y",
@@ -160,6 +293,8 @@ def burn_captions(video_in: Path, srt_path: Path, video_out: Path, caption_style
     if log_fn:
         log_fn("== ffmpeg burn captions ==")
         log_fn(out)
+        log_fn(f"caption_font={pick_caption_font(lang)} video_h={vh} style={caption_style}")
+        log_fn(f"fontsdir={fontsdir}")
     if rc != 0 or (not video_out.exists()) or video_out.stat().st_size < 10_000:
         tail = "\n".join(out.splitlines()[-200:])
         raise RuntimeError(f"burn captions failed (rc={rc})\n{tail}")
@@ -642,13 +777,18 @@ def estimate_median_f0(audio_wav: Path, sr_expected: int = 16000) -> Optional[fl
 
 def infer_gender_from_f0(f0_hz: Optional[float]) -> str:
     """
-    Very simple heuristic:
-    - <= 165 Hz: likely male
-    - > 165 Hz: likely female
+    Safer heuristic:
+    - < 145 Hz: likely male
+    - > 190 Hz: likely female
+    - between: unknown (avoid wrong flips)
     """
     if not f0_hz:
         return "unknown"
-    return "female" if f0_hz > 165.0 else "male"
+    if f0_hz < 145.0:
+        return "male"
+    if f0_hz > 190.0:
+        return "female"
+    return "unknown"
 
 def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
     proc = subprocess.run(
@@ -1706,11 +1846,29 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
                         log(f"seg={idx} dur={dur:.2f}s gender={speaker_gender} voice={voice} text={seg_tr[:60]}")
 
                         # Generate raw segment audio
+                        def tts_edge_best_fit(text: str, lang: str, out_wav: Path, target_sec: float, gender: str) -> Tuple[str, float]:
+                            """
+                            Prefer Edge-native speaking rate changes over ffmpeg atempo.
+                            Returns (rate_used, duration_sec).
+                            """
+                            base = _base_rate_for_lang(lang)
+                            for rate in _rate_candidates(base):
+                                tts_edge(text, lang, out_wav, rate=rate, log_fn=None, gender=gender)
+                                d = wav_duration_seconds(out_wav)
+                                if d <= target_sec * SEGMENT_FIT_TOLERANCE:
+                                    return rate, d
+                            # still too long - keep last and let stretch_or_pad_to_duration atempo it
+                            d = wav_duration_seconds(out_wav)
+                            return _rate_candidates(base)[-1], d
+
                         provider = (os.getenv("TTS_PROVIDER") or "auto").strip().lower()
                         if provider in {"auto", "edge"}:
-                            tts_edge(seg_tr, lang, seg_raw, rate=_base_rate_for_lang(lang), log_fn=None, gender=speaker_gender)
+                            rate_used, raw_d = tts_edge_best_fit(seg_tr, lang, seg_raw, dur, speaker_gender)
+                            log(f"seg={idx} edge_rate={rate_used} raw_dur={raw_d:.2f}s target={dur:.2f}s")
                         else:
                             tts_espeak(seg_tr, lang, seg_raw)
+                            raw_d = wav_duration_seconds(seg_raw)
+                            log(f"seg={idx} espeak raw_dur={raw_d:.2f}s target={dur:.2f}s")
 
                         # Fit to exact segment window without slowing down (pad if short, speed up only if long)
                         stretch_or_pad_to_duration(seg_raw, seg_fit, dur, log_fn=None)
@@ -1740,7 +1898,8 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
 
                     if subs:
                         log(f"burning_captions style={caption_style} ...")
-                        burn_captions(tmp_video, srt_path, out_video, caption_style, log_fn=log)
+                        burn_captions(tmp_video, srt_path, out_video, caption_style, lang=lang, log_fn=log)
+
                     else:
                         tmp_video.replace(out_video)
 
@@ -1770,7 +1929,7 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
                     mux_audio_into_video(video_in, out_audio, tmp_video, log_fn=log)
 
                     log(f"burning_captions style={caption_style} ...")
-                    burn_captions(tmp_video, srt_path, out_video, caption_style, log_fn=log)
+                    burn_captions(tmp_video, srt_path, out_video, caption_style, lang=lang, log_fn=log)
 
                     if not out_video.exists() or out_video.stat().st_size < 10_000:
                         raise RuntimeError("dub video not generated")
