@@ -48,9 +48,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+JOB_SEM = threading.Semaphore(1)
+DUB_SEM = threading.Semaphore(1)
+
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
+
+MAX_LOG_CHARS = int(os.getenv("MAX_LOG_CHARS", "20000"))
 
 TRANSLATE_PROVIDER = (os.getenv("TRANSLATE_PROVIDER") or "google_free").strip().lower()
 ENABLE_LOCAL_NLLB = (os.getenv("ENABLE_LOCAL_NLLB") or "").strip().lower() in {"1", "true", "yes"}
@@ -397,7 +402,9 @@ def sb_append_log(job_id: str, text: str) -> None:
         current = ""
         if data and isinstance(data, list) and len(data) > 0:
             current = data[0].get("log_text") or ""
-        updated = current + ("" if current.endswith("\n") or current == "" else "\n") + text
+        updated = (current + ("" if current.endswith("\n") or current == "" else "\n") + text)
+        updated = updated[-MAX_LOG_CHARS:]
+
         _supabase.table("clip_jobs").update({"log_text": updated, "updated_at": now_iso()}).eq("id", job_id).execute()
     except Exception as e:
         print(f"WARNING: sb_append_log failed: {e}")
@@ -478,7 +485,9 @@ def sb_append_dub_log(job_id: str, lang: str, line: str) -> None:
         if data and isinstance(data, list) and len(data) > 0:
             current = _as_dict(data[0].get("dub_log_text"))
         prev = current.get(lang) or ""
-        updated = prev + ("" if prev.endswith("\n") or prev == "" else "\n") + line.rstrip()
+        updated = (prev + ("" if prev.endswith("\n") or prev == "" else "\n") + line.rstrip())
+        updated = updated[-MAX_LOG_CHARS:]
+
         current[lang] = updated
         _supabase.table("clip_jobs").update({"dub_log_text": current, "updated_at": now_iso()}).eq("id", job_id).execute()
     except Exception as e:
@@ -760,171 +769,174 @@ def write_dub_status(job_id: str, lang: str, status: str, error: Optional[str] =
 # -----------------------------------------------------------------------------
 
 def process_job(job_id: str, url: str) -> None:
-    tmp_job_dir = TMP_DIR / job_id
-    tmp_job_dir.mkdir(parents=True, exist_ok=True)
-    paths = _job_artifact_paths(job_id)
-    paths["job_dir"].mkdir(parents=True, exist_ok=True)
-    out_template = "download.%(ext)s"
-    out_log = paths["log"]
-    runner_log = paths["runner_log"]
+    with JOB_SEM:
+        tmp_job_dir = TMP_DIR / job_id
+        tmp_job_dir.mkdir(parents=True, exist_ok=True)
+        paths = _job_artifact_paths(job_id)
+        paths["job_dir"].mkdir(parents=True, exist_ok=True)
+        out_template = "download.%(ext)s"
+        out_log = paths["log"]
+        runner_log = paths["runner_log"]
 
-    update_job(
-        job_id,
-        {
-            "status": "running",
-            "updated_at": now_iso(),
-            "updated_at_ts": time.time(),
-            "log_path": str(out_log.resolve()),
-            "runner_log_path": str(runner_log.resolve()),
-        },
-    )
-
-    log_lines: List[str] = []
-    try:
-        yt_dlp_bin = require_bin("yt-dlp")
-        ffmpeg_bin = require_bin("ffmpeg")
-        log_lines.append("== ENV ==")
-        log_lines.append(f"BUILD_TAG={BUILD_TAG}")
-        log_lines.append(f"yt-dlp={yt_dlp_bin}")
-        log_lines.append(f"ffmpeg={ffmpeg_bin}")
-        log_lines.append(f"DATA_DIR={DATA_DIR}")
-        log_lines.append(f"TMP_DIR={TMP_DIR}")
-        log_lines.append(f"job_dir={paths['job_dir']}")
-        log_lines.append(f"tmp_job_dir={tmp_job_dir}")
-
-        cookies_file = materialize_cookies(tmp_job_dir, log_lines)
-        cookies_args: List[str] = ["--cookies", str(cookies_file)] if cookies_file else []
-
-        dl_cmd: List[str] = [
-            yt_dlp_bin,
-            "--no-playlist",
-            "--newline",
-            "--retries",
-            "5",
-            "--fragment-retries",
-            "5",
-            "--socket-timeout",
-            "30",
-            "--concurrent-fragments",
-            "2",
-            "--sleep-interval",
-            "1",
-            "--max-sleep-interval",
-            "3",
-            "--extractor-args",
-            "youtube:player_client=web",
-        ]
-        if yt_dlp_supports(yt_dlp_bin, "--js-runtimes"):
-            dl_cmd += ["--js-runtimes", "node"]
-            log_lines.append("js_runtime=enabled(--js-runtimes node)")
-        if yt_dlp_supports(yt_dlp_bin, "--remote-components"):
-            dl_cmd += ["--remote-components", "ejs:github"]
-            log_lines.append("remote_components=enabled(ejs:github)")
-
-        dl_cmd += [
-            "-S",
-            "ext:mp4:m4a,codec:h264",
-            "-f",
-            "bv*+ba/best",
-            "--merge-output-format",
-            "mp4",
-            "-o",
-            out_template,
-            *cookies_args,
-            str(url),
-        ]
-
-        rc, out = run_cmd(dl_cmd, cwd=tmp_job_dir)
-        log_lines.append("== yt-dlp ==")
-        log_lines.append(out)
-        sb_append_log(job_id, "\n".join(log_lines[-80:]) + "\n")
-
-        if rc != 0:
-            tail = "\n".join(out.splitlines()[-200:])
-            log_lines.append("== tmp dir listing ==")
-            log_lines.append(list_dir(tmp_job_dir))
-            sb_append_log(job_id, "\nERROR: download failed\n" + tail + "\n")
-            raise RuntimeError(f"download failed (rc={rc})\n{tail}")
-
-        mp4s = sorted(tmp_job_dir.glob("download*.mp4"), key=lambda p: p.stat().st_size, reverse=True)
-        if not mp4s:
-            log_lines.append("== tmp dir listing ==")
-            log_lines.append(list_dir(tmp_job_dir))
-            sb_append_log(job_id, "\nERROR: no mp4 produced\n")
-            raise RuntimeError("download produced no mp4")
-
-        merged_video = mp4s[0]
-        if not wait_for_file(merged_video, min_bytes=1024 * 200):
-            sb_append_log(job_id, "\nERROR: mp4 too small/not ready\n")
-            raise RuntimeError("mp4 too small or not ready")
-
-        tmp_audio = tmp_job_dir / "audio.wav"
-        ff_cmd = [ffmpeg_bin, "-y", "-i", str(merged_video), "-ac", "1", "-ar", "16000", str(tmp_audio)]
-        rc2, out2 = run_cmd(ff_cmd, cwd=None)
-        log_lines.append("== ffmpeg extract ==")
-        log_lines.append(out2)
-        sb_append_log(job_id, "\n".join(log_lines[-80:]) + "\n")
-
-        if rc2 != 0:
-            tail = "\n".join(out2.splitlines()[-200:])
-            sb_append_log(job_id, "\nERROR: audio extraction failed\n" + tail + "\n")
-            raise RuntimeError(f"audio extraction failed (rc={rc2})\n{tail}")
-
-        if not wait_for_file(tmp_audio, min_bytes=1024 * 10):
-            sb_append_log(job_id, "\nERROR: wav not ready\n")
-            raise RuntimeError("audio wav not ready")
-
-        paths["video"].parent.mkdir(parents=True, exist_ok=True)
-        safe_move(merged_video, paths["video"])
-        safe_move(tmp_audio, paths["audio"])
-
-        out_log.write_text("\n".join(log_lines), encoding="utf-8", errors="ignore")
-        sb_append_log(job_id, "\n== DONE ==\n")
-
-        urls = _artifact_urls(job_id)
-        video_key = sb_upload_file(job_id, paths["video"], "video.mp4", "video/mp4")
-        audio_key = sb_upload_file(job_id, paths["audio"], "audio.wav", "audio/wav")
-        log_key = sb_upload_file(job_id, paths["log"], "log.txt", "text/plain")
-
-        update_job(job_id, {"storage_video_key": video_key, "storage_audio_key": audio_key, "storage_log_key": log_key})
         update_job(
             job_id,
             {
-                "status": "done",
-                "error": None,
-                "video_path": str(paths["video"].resolve()),
-                "audio_path": str(paths["audio"].resolve()),
-                "log_path": str(out_log.resolve()),
-                **urls,
+                "status": "running",
                 "updated_at": now_iso(),
                 "updated_at_ts": time.time(),
-            },
-        )
-    except Exception as e:
-        try:
-            out_log.write_text("\n".join(log_lines) + f"\nERROR: {e}\n", encoding="utf-8", errors="ignore")
-        except Exception:
-            pass
-        sb_append_log(job_id, f"\nERROR: {e}\n")
-        urls = _artifact_urls(job_id)
-        update_job(
-            job_id,
-            {
-                "status": "error",
-                "error": str(e),
-                "video_path": None,
-                "audio_path": None,
                 "log_path": str(out_log.resolve()),
-                **urls,
-                "updated_at": now_iso(),
-                "updated_at_ts": time.time(),
+                "runner_log_path": str(runner_log.resolve()),
             },
         )
-    finally:
+
+        log_lines: List[str] = []
         try:
-            shutil.rmtree(tmp_job_dir, ignore_errors=True)
-        except Exception:
-            pass
+            yt_dlp_bin = require_bin("yt-dlp")
+            ffmpeg_bin = require_bin("ffmpeg")
+            log_lines.append("== ENV ==")
+            log_lines.append(f"BUILD_TAG={BUILD_TAG}")
+            log_lines.append(f"yt-dlp={yt_dlp_bin}")
+            log_lines.append(f"ffmpeg={ffmpeg_bin}")
+            log_lines.append(f"DATA_DIR={DATA_DIR}")
+            log_lines.append(f"TMP_DIR={TMP_DIR}")
+            log_lines.append(f"job_dir={paths['job_dir']}")
+            log_lines.append(f"tmp_job_dir={tmp_job_dir}")
+
+            cookies_file = materialize_cookies(tmp_job_dir, log_lines)
+            cookies_args: List[str] = ["--cookies", str(cookies_file)] if cookies_file else []
+
+            dl_cmd: List[str] = [
+                yt_dlp_bin,
+                "--no-playlist",
+                "--newline",
+                "--retries",
+                "5",
+                "--fragment-retries",
+                "5",
+                "--socket-timeout",
+                "30",
+                "--concurrent-fragments",
+                "2",
+                "--sleep-interval",
+                "1",
+                "--max-sleep-interval",
+                "3",
+                "--extractor-args",
+                "youtube:player_client=web",
+            ]
+            if yt_dlp_supports(yt_dlp_bin, "--js-runtimes"):
+                dl_cmd += ["--js-runtimes", "node"]
+                log_lines.append("js_runtime=enabled(--js-runtimes node)")
+            if yt_dlp_supports(yt_dlp_bin, "--remote-components"):
+                dl_cmd += ["--remote-components", "ejs:github"]
+                log_lines.append("remote_components=enabled(ejs:github)")
+
+            dl_cmd += [
+                "-S",
+                "ext:mp4:m4a,codec:h264",
+                "-f",
+                "bv*+ba/best",
+                "--merge-output-format",
+                "mp4",
+                "-o",
+                out_template,
+                *cookies_args,
+                str(url),
+            ]
+
+            rc, out = run_cmd(dl_cmd, cwd=tmp_job_dir)
+            out = out[-20000:]
+            log_lines.append("== yt-dlp ==")
+            log_lines.append(out)
+            sb_append_log(job_id, "\n".join(log_lines[-80:]) + "\n")
+
+            if rc != 0:
+                tail = "\n".join(out.splitlines()[-200:])
+                log_lines.append("== tmp dir listing ==")
+                log_lines.append(list_dir(tmp_job_dir))
+                sb_append_log(job_id, "\nERROR: download failed\n" + tail + "\n")
+                raise RuntimeError(f"download failed (rc={rc})\n{tail}")
+
+            mp4s = sorted(tmp_job_dir.glob("download*.mp4"), key=lambda p: p.stat().st_size, reverse=True)
+            if not mp4s:
+                log_lines.append("== tmp dir listing ==")
+                log_lines.append(list_dir(tmp_job_dir))
+                sb_append_log(job_id, "\nERROR: no mp4 produced\n")
+                raise RuntimeError("download produced no mp4")
+
+            merged_video = mp4s[0]
+            if not wait_for_file(merged_video, min_bytes=1024 * 200):
+                sb_append_log(job_id, "\nERROR: mp4 too small/not ready\n")
+                raise RuntimeError("mp4 too small or not ready")
+
+            tmp_audio = tmp_job_dir / "audio.wav"
+            ff_cmd = [ffmpeg_bin, "-y", "-i", str(merged_video), "-ac", "1", "-ar", "16000", str(tmp_audio)]
+            rc2, out2 = run_cmd(ff_cmd, cwd=None)
+            out2 = out2[-20000:]
+            log_lines.append("== ffmpeg extract ==")
+            log_lines.append(out2)
+            sb_append_log(job_id, "\n".join(log_lines[-80:]) + "\n")
+
+            if rc2 != 0:
+                tail = "\n".join(out2.splitlines()[-200:])
+                sb_append_log(job_id, "\nERROR: audio extraction failed\n" + tail + "\n")
+                raise RuntimeError(f"audio extraction failed (rc={rc2})\n{tail}")
+
+            if not wait_for_file(tmp_audio, min_bytes=1024 * 10):
+                sb_append_log(job_id, "\nERROR: wav not ready\n")
+                raise RuntimeError("audio wav not ready")
+
+            paths["video"].parent.mkdir(parents=True, exist_ok=True)
+            safe_move(merged_video, paths["video"])
+            safe_move(tmp_audio, paths["audio"])
+
+            out_log.write_text("\n".join(log_lines), encoding="utf-8", errors="ignore")
+            sb_append_log(job_id, "\n== DONE ==\n")
+
+            urls = _artifact_urls(job_id)
+            video_key = sb_upload_file(job_id, paths["video"], "video.mp4", "video/mp4")
+            audio_key = sb_upload_file(job_id, paths["audio"], "audio.wav", "audio/wav")
+            log_key = sb_upload_file(job_id, paths["log"], "log.txt", "text/plain")
+
+            update_job(job_id, {"storage_video_key": video_key, "storage_audio_key": audio_key, "storage_log_key": log_key})
+            update_job(
+                job_id,
+                {
+                    "status": "done",
+                    "error": None,
+                    "video_path": str(paths["video"].resolve()),
+                    "audio_path": str(paths["audio"].resolve()),
+                    "log_path": str(out_log.resolve()),
+                    **urls,
+                    "updated_at": now_iso(),
+                    "updated_at_ts": time.time(),
+                },
+            )
+        except Exception as e:
+            try:
+                out_log.write_text("\n".join(log_lines) + f"\nERROR: {e}\n", encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+            sb_append_log(job_id, f"\nERROR: {e}\n")
+            urls = _artifact_urls(job_id)
+            update_job(
+                job_id,
+                {
+                    "status": "error",
+                    "error": str(e),
+                    "video_path": None,
+                    "audio_path": None,
+                    "log_path": str(out_log.resolve()),
+                    **urls,
+                    "updated_at": now_iso(),
+                    "updated_at_ts": time.time(),
+                },
+            )
+        finally:
+            try:
+                shutil.rmtree(tmp_job_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 # -----------------------------------------------------------------------------
 # Transcribe + translate
@@ -1567,227 +1579,227 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
         sb_upsert_dub_status(job_id, lang, "error", error="unsupported lang")
         return
 
-    dd = dub_dir(job_id, lang)
-    dd.mkdir(parents=True, exist_ok=True)
-    local_log_path = dub_log_path(job_id, lang)
+    with DUB_SEM:
+        dd = dub_dir(job_id, lang)
+        dd.mkdir(parents=True, exist_ok=True)
+        local_log_path = dub_log_path(job_id, lang)
 
-    caption_style = (caption_style or "clean").strip().lower()
-    if caption_style not in CAPTION_STYLE_FORCE:
-        caption_style = "clean"
+        caption_style = (caption_style or "clean").strip().lower()
+        if caption_style not in CAPTION_STYLE_FORCE:
+            caption_style = "clean"
 
-    srt_path = dd / "captions.srt"
+        srt_path = dd / "captions.srt"
 
-    def log(line: str) -> None:
-        line = line.rstrip()
-        with open(local_log_path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-        sb_append_dub_log(job_id, lang, line)
+        def log(line: str) -> None:
+            line = line.rstrip()
+            with open(local_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            sb_append_dub_log(job_id, lang, line)
 
-    def heartbeat() -> None:
-        sb_upsert_dub_status(job_id, lang, "running", error=None)
+        def heartbeat() -> None:
+            sb_upsert_dub_status(job_id, lang, "running", error=None)
 
-    try:
-        write_dub_status(job_id, lang, "running")
-        log("== DUB START (TIMED) ==")
-        log(f"timed_dub={ENABLE_TIMED_DUB}")
-        log(f"audio_norm={ENABLE_AUDIO_NORMALIZATION}")
-        log(f"whisper_model={WHISPER_MODEL} translate={TRANSLATE_PROVIDER}")
+        try:
+            write_dub_status(job_id, lang, "running")
+            log("== DUB START (TIMED) ==")
+            log(f"timed_dub={ENABLE_TIMED_DUB}")
+            log(f"audio_norm={ENABLE_AUDIO_NORMALIZATION}")
+            log(f"whisper_model={WHISPER_MODEL} translate={TRANSLATE_PROVIDER}")
 
-        heartbeat()
-
-        job = load_job_for_artifacts(job_id)
-        if job.get("status") != "done":
-            raise RuntimeError(f"base job not done (status={job.get('status')})")
-
-        video_in, audio_in = ensure_base_artifacts_local(job_id, job)
-        out_audio = dub_audio_path(job_id, lang)
-        out_video = dub_video_path(job_id, lang)
-
-        mode = (os.getenv("VOICE_GENDER_MODE") or "auto").strip().lower()
-        speaker_gender = "unknown"
-        speaker_f0 = None
-
-        if mode in {"male", "female"}:
-            speaker_gender = mode
-        else:
-            speaker_f0 = estimate_median_f0(audio_in)
-            speaker_gender = infer_gender_from_f0(speaker_f0)
-
-        log(f"speaker_f0_hz={speaker_f0} speaker_gender={speaker_gender}")
-
-        if (
-            out_audio.exists()
-            and out_video.exists()
-            and srt_path.exists()
-            and out_audio.stat().st_size > 2048
-            and out_video.stat().st_size > 10_000
-        ):
-            log("cached=true (local dub exists)")
-        else:
-            ffmpeg = require_bin("ffmpeg")
-            _ = ffmpeg  # keeps lint calm
-
-            log("transcribing...")
-            tr = whisper_transcribe(audio_in)
-            src_text = tr.get("text", "") or ""
-            segs = tr.get("segments", []) or []
-            log(f"transcribed_chars={len(src_text)} segments={len(segs)}")
             heartbeat()
 
-            if not src_text.strip():
-                raise RuntimeError("transcription empty")
+            job = load_job_for_artifacts(job_id)
+            if job.get("status") != "done":
+                raise RuntimeError(f"base job not done (status={job.get('status')})")
 
-            merged = merge_whisper_segments(segs) if (ENABLE_TIMED_DUB and segs) else []
-            log(f"segments_merged={len(merged)}")
-            # Timed path
-            if ENABLE_TIMED_DUB and merged and len(merged) <= MAX_DUB_SEGMENTS:
+            video_in, audio_in = ensure_base_artifacts_local(job_id, job)
+            out_audio = dub_audio_path(job_id, lang)
+            out_video = dub_video_path(job_id, lang)
 
-                # Build timed audio using segment timeline + gap silence (best lip sync)
-                
-                if not merged:
-                    raise RuntimeError("no usable segments after merge")
+            mode = (os.getenv("VOICE_GENDER_MODE") or "auto").strip().lower()
+            speaker_gender = "unknown"
+            speaker_f0 = None
 
-                # Optional: cap segments for speed
-                max_segments = int(os.getenv("MAX_DUB_SEGMENTS", "140"))
-                merged = merged[:max_segments]
+            if mode in {"male", "female"}:
+                speaker_gender = mode
+            else:
+                speaker_f0 = estimate_median_f0(audio_in)
+                speaker_gender = infer_gender_from_f0(speaker_f0)
 
-                timeline_parts: List[Path] = []
-                prev_end = 0.0
+            log(f"speaker_f0_hz={speaker_f0} speaker_gender={speaker_gender}")
 
-                seg_tmp_dir = dd / "segs"
-                seg_tmp_dir.mkdir(parents=True, exist_ok=True)
+            if (
+                out_audio.exists()
+                and out_video.exists()
+                and srt_path.exists()
+                and out_audio.stat().st_size > 2048
+                and out_video.stat().st_size > 10_000
+            ):
+                log("cached=true (local dub exists)")
+            else:
+                ffmpeg = require_bin("ffmpeg")
+                _ = ffmpeg  # keeps lint calm
 
-                log(f"building_timed_audio segments={len(merged)}")
+                log("transcribing...")
+                tr = whisper_transcribe(audio_in)
+                src_text = tr.get("text", "") or ""
+                segs = tr.get("segments", []) or []
+                log(f"transcribed_chars={len(src_text)} segments={len(segs)}")
+                heartbeat()
 
-                subs: List[Dict[str, Any]] = []
+                if not src_text.strip():
+                    raise RuntimeError("transcription empty")
 
-                for idx, s in enumerate(merged):
-                    start = float(s.get("start", 0.0))
-                    end = float(s.get("end", 0.0))
-                    seg_text = (s.get("text") or "").strip()
-                    dur = max(0.06, end - start)
+                merged = merge_whisper_segments(segs) if (ENABLE_TIMED_DUB and segs) else []
+                log(f"segments_merged={len(merged)}")
+                # Timed path
+                if ENABLE_TIMED_DUB and merged and len(merged) <= MAX_DUB_SEGMENTS:
 
-                    if not seg_text:
-                        continue
+                    # Build timed audio using segment timeline + gap silence (best lip sync)
+                    
+                    if not merged:
+                        raise RuntimeError("no usable segments after merge")
 
-                    heartbeat()
+                    # Optional: cap segments for speed
+                    max_segments = int(os.getenv("MAX_DUB_SEGMENTS", "140"))
+                    merged = merged[:max_segments]
 
-                    # Insert gap silence so we respect original timing
-                    gap = start - prev_end
-                    if gap > 0.02:
-                        sil = seg_tmp_dir / f"seg_{idx:04d}_gap.wav"
-                        make_silence_wav(gap, sil)
-                        timeline_parts.append(sil)
+                    timeline_parts: List[Path] = []
+                    prev_end = 0.0
 
-                    # Translate per segment (keeps boundaries aligned)
-                    seg_tr = seg_text if lang == "en" else translate_text(seg_text, lang)
-                    seg_tr = (seg_tr or "").strip()
-                    if not seg_tr:
-                        seg_tr = seg_text  # fallback to avoid accidental silence
-                    subs.append({"start": start, "end": end, "text": seg_tr})
-                    seg_raw = seg_tmp_dir / f"seg_{idx:04d}_raw.wav"
-                    seg_fit = seg_tmp_dir / f"seg_{idx:04d}_fit.wav"
+                    seg_tmp_dir = dd / "segs"
+                    seg_tmp_dir.mkdir(parents=True, exist_ok=True)
 
-                    # TTS per segment with gender-aware voice
-                    voice = _edge_voice_for(lang, speaker_gender)
-                    log(f"seg={idx} dur={dur:.2f}s gender={speaker_gender} voice={voice} text={seg_tr[:60]}")
+                    log(f"building_timed_audio segments={len(merged)}")
 
-                    # Generate raw segment audio
-                    provider = (os.getenv("TTS_PROVIDER") or "auto").strip().lower()
-                    if provider in {"auto", "edge"}:
-                        tts_edge(seg_tr, lang, seg_raw, rate=_base_rate_for_lang(lang), log_fn=None, gender=speaker_gender)
+                    subs: List[Dict[str, Any]] = []
+
+                    for idx, s in enumerate(merged):
+                        start = float(s.get("start", 0.0))
+                        end = float(s.get("end", 0.0))
+                        seg_text = (s.get("text") or "").strip()
+                        dur = max(0.06, end - start)
+
+                        if not seg_text:
+                            continue
+
+                        heartbeat()
+
+                        # Insert gap silence so we respect original timing
+                        gap = start - prev_end
+                        if gap > 0.02:
+                            sil = seg_tmp_dir / f"seg_{idx:04d}_gap.wav"
+                            make_silence_wav(gap, sil)
+                            timeline_parts.append(sil)
+
+                        # Translate per segment (keeps boundaries aligned)
+                        seg_tr = seg_text if lang == "en" else translate_text(seg_text, lang)
+                        seg_tr = (seg_tr or "").strip()
+                        if not seg_tr:
+                            seg_tr = seg_text  # fallback to avoid accidental silence
+                        subs.append({"start": start, "end": end, "text": seg_tr})
+                        seg_raw = seg_tmp_dir / f"seg_{idx:04d}_raw.wav"
+                        seg_fit = seg_tmp_dir / f"seg_{idx:04d}_fit.wav"
+
+                        # TTS per segment with gender-aware voice
+                        voice = _edge_voice_for(lang, speaker_gender)
+                        log(f"seg={idx} dur={dur:.2f}s gender={speaker_gender} voice={voice} text={seg_tr[:60]}")
+
+                        # Generate raw segment audio
+                        provider = (os.getenv("TTS_PROVIDER") or "auto").strip().lower()
+                        if provider in {"auto", "edge"}:
+                            tts_edge(seg_tr, lang, seg_raw, rate=_base_rate_for_lang(lang), log_fn=None, gender=speaker_gender)
+                        else:
+                            tts_espeak(seg_tr, lang, seg_raw)
+
+                        # Fit to exact segment window without slowing down (pad if short, speed up only if long)
+                        stretch_or_pad_to_duration(seg_raw, seg_fit, dur, log_fn=None)
+                        timeline_parts.append(seg_fit)
+
+                        prev_end = max(prev_end, end)
+
+                    if subs:
+                        write_srt(subs, srt_path)
+
+                    if not timeline_parts:
+                        raise RuntimeError("no timeline parts generated")
+
+                    stitched = dd / "stitched.wav"
+                    log(f"stitching_parts={len(timeline_parts)}")
+                    ffmpeg_concat_wavs(timeline_parts, stitched, log_fn=None)
+
+                    final = dd / "final.wav"
+                    pad_or_trim_to_video_length(stitched, video_in, final, log_fn=None)
+
+                    normalize_audio(final, log_fn=log)
+                    safe_move(final, out_audio)
+
+                    log("muxing_audio_into_video...")
+                    tmp_video = dd / "video_with_audio.mp4"
+                    mux_audio_into_video(video_in, out_audio, tmp_video, log_fn=log)
+
+                    if subs:
+                        log(f"burning_captions style={caption_style} ...")
+                        burn_captions(tmp_video, srt_path, out_video, caption_style, log_fn=log)
                     else:
-                        tts_espeak(seg_tr, lang, seg_raw)
+                        tmp_video.replace(out_video)
 
-                    # Fit to exact segment window without slowing down (pad if short, speed up only if long)
-                    stretch_or_pad_to_duration(seg_raw, seg_fit, dur, log_fn=None)
-                    timeline_parts.append(seg_fit)
+                    if not out_video.exists() or out_video.stat().st_size < 10_000:
+                        raise RuntimeError("dub video not generated")
 
-                    prev_end = max(prev_end, end)
+                    log("dub_files=generated (timed)")
+                else:
+                    # Fallback: full text TTS
+                    log("timed_dub_unavailable=true (fallback to full-text TTS)")
+                    translated = src_text if lang == "en" else translate_text(src_text, lang)
+                    vd = video_duration_seconds(video_in) or 0.0
+                    end_ts = vd if vd > 0 else float(merged[-1]["end"]) if merged else 5.0
+                    write_srt([{"start": 0.0, "end": end_ts, "text": translated}], srt_path)
 
-                if subs:
-                    write_srt(subs, srt_path)
+                    if not translated.strip():
+                        raise RuntimeError("translation empty")
 
-                if not timeline_parts:
-                    raise RuntimeError("no timeline parts generated")
+                    tts_speak(translated, lang, out_audio, log_fn=log, gender=speaker_gender)
+                    if not out_audio.exists() or out_audio.stat().st_size < 2048:
+                        raise RuntimeError("dub audio not generated")
 
-                stitched = dd / "stitched.wav"
-                log(f"stitching_parts={len(timeline_parts)}")
-                ffmpeg_concat_wavs(timeline_parts, stitched, log_fn=None)
+                    normalize_audio(out_audio, log_fn=log)
 
-                final = dd / "final.wav"
-                pad_or_trim_to_video_length(stitched, video_in, final, log_fn=None)
+                    log("muxing_audio_into_video...")
+                    tmp_video = dd / "video_with_audio.mp4"
+                    mux_audio_into_video(video_in, out_audio, tmp_video, log_fn=log)
 
-                normalize_audio(final, log_fn=log)
-                safe_move(final, out_audio)
-
-
-                log("muxing_audio_into_video...")
-                tmp_video = dd / "video_with_audio.mp4"
-                mux_audio_into_video(video_in, out_audio, tmp_video, log_fn=log)
-
-                if subs:
                     log(f"burning_captions style={caption_style} ...")
                     burn_captions(tmp_video, srt_path, out_video, caption_style, log_fn=log)
-                else:
-                    tmp_video.replace(out_video)
 
-                if not out_video.exists() or out_video.stat().st_size < 10_000:
-                    raise RuntimeError("dub video not generated")
+                    if not out_video.exists() or out_video.stat().st_size < 10_000:
+                        raise RuntimeError("dub video not generated")
 
-                log("dub_files=generated (timed)")
-            else:
-                # Fallback: full text TTS
-                log("timed_dub_unavailable=true (fallback to full-text TTS)")
-                translated = src_text if lang == "en" else translate_text(src_text, lang)
-                vd = video_duration_seconds(video_in) or 0.0
-                end_ts = vd if vd > 0 else float(merged[-1]["end"]) if merged else 5.0
-                write_srt([{"start": 0.0, "end": end_ts, "text": translated}], srt_path)
+                    log("dub_files=generated (fallback)")
 
-                if not translated.strip():
-                    raise RuntimeError("translation empty")
+            log("uploading_to_storage...")
+            audio_key = sb_upload_file(job_id, out_audio, f"dubs/{lang}/audio.wav", "audio/wav")
+            video_key = sb_upload_file(job_id, out_video, f"dubs/{lang}/video.mp4", "video/mp4")
+            log_key = sb_upload_file(job_id, local_log_path, f"dubs/{lang}/log.txt", "text/plain")
 
-                tts_speak(translated, lang, out_audio, log_fn=log, gender=speaker_gender)
-                if not out_audio.exists() or out_audio.stat().st_size < 2048:
-                    raise RuntimeError("dub audio not generated")
+            srt_key = sb_upload_file(job_id, srt_path, f"dubs/{lang}/captions.srt", "text/plain")
 
-                normalize_audio(out_audio, log_fn=log)
+            log("uploaded_to_storage=true")
 
-                log("muxing_audio_into_video...")
-                tmp_video = dd / "video_with_audio.mp4"
-                mux_audio_into_video(video_in, out_audio, tmp_video, log_fn=log)
+            sb_upsert_dub_status(job_id, lang, "done", error=None, audio_key=audio_key, video_key=video_key, log_key=log_key)
+            write_dub_status(job_id, lang, "done")
+            log("== DUB DONE ==")
 
-                log(f"burning_captions style={caption_style} ...")
-                burn_captions(tmp_video, srt_path, out_video, caption_style, log_fn=log)
-
-                if not out_video.exists() or out_video.stat().st_size < 10_000:
-                    raise RuntimeError("dub video not generated")
-
-                log("dub_files=generated (fallback)")
-
-        log("uploading_to_storage...")
-        audio_key = sb_upload_file(job_id, out_audio, f"dubs/{lang}/audio.wav", "audio/wav")
-        video_key = sb_upload_file(job_id, out_video, f"dubs/{lang}/video.mp4", "video/mp4")
-        log_key = sb_upload_file(job_id, local_log_path, f"dubs/{lang}/log.txt", "text/plain")
-
-        srt_key = sb_upload_file(job_id, srt_path, f"dubs/{lang}/captions.srt", "text/plain")
-
-        log("uploaded_to_storage=true")
-
-        sb_upsert_dub_status(job_id, lang, "done", error=None, audio_key=audio_key, video_key=video_key, log_key=log_key)
-        write_dub_status(job_id, lang, "done")
-        log("== DUB DONE ==")
-
-    except Exception as e:
-        error_msg = f"ERROR: {e}"
-        try:
-            with open(local_log_path, "a", encoding="utf-8") as f:
-                f.write(error_msg + "\n")
-        except Exception:
-            pass
-        sb_upsert_dub_status(job_id, lang, "error", error=str(e))
-        write_dub_status(job_id, lang, "error", str(e))
-        print(error_msg)
+        except Exception as e:
+            error_msg = f"ERROR: {e}"
+            try:
+                with open(local_log_path, "a", encoding="utf-8") as f:
+                    f.write(error_msg + "\n")
+            except Exception:
+                pass
+            sb_upsert_dub_status(job_id, lang, "error", error=str(e))
+            write_dub_status(job_id, lang, "error", str(e))
+            print(error_msg)
 
 # -----------------------------------------------------------------------------
 # API Schemas & Routes
