@@ -1,9 +1,17 @@
+// JobClient.tsx
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
 
 type JobStatus = "queued" | "running" | "done" | "error";
+
+type DubStatusValue =
+  | "queued"
+  | "running"
+  | "done"
+  | "error"
+  | { status?: "queued" | "running" | "done" | "error"; error?: string | null; updated_at?: string };
 
 type Job = {
   id: string;
@@ -19,8 +27,7 @@ type Job = {
   audio_url?: string | null;
   log_url?: string | null;
 
-  dub_status?: Record<string, { status?: string; error?: string | null } | string>;
-
+  dub_status?: Record<string, DubStatusValue>;
   created_at: string;
   updated_at: string;
 };
@@ -35,7 +42,7 @@ const LANGS = [
   { code: "es", label: "Spanish" },
 ] as const;
 
-type DubState = { status: "not_started" | "running" | "done" | "error"; error?: string | null };
+type LangCode = (typeof LANGS)[number]["code"];
 
 const CAPTION_STYLES = [
   { id: "clean", label: "Clean" },
@@ -46,18 +53,29 @@ const CAPTION_STYLES = [
 
 type CaptionStyle = (typeof CAPTION_STYLES)[number]["id"];
 
+type DubState = { status: "not_started" | "queued" | "running" | "done" | "error"; error?: string | null };
+
+function parseJsonSafe<T = any>(text: string): T | null {
+  try {
+    return text ? (JSON.parse(text) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
 function readDubState(job: Job | null, lang: string): DubState {
   const raw = job?.dub_status?.[lang];
   if (!raw) return { status: "not_started" };
 
   if (typeof raw === "string") {
-    if (raw === "done" || raw === "running" || raw === "error") return { status: raw };
+    if (raw === "queued" || raw === "running" || raw === "done" || raw === "error") return { status: raw };
     return { status: "running" };
   }
 
-  const s = String((raw as any)?.status || "running");
-  const e = (raw as any)?.error ?? null;
-  if (s === "done" || s === "running" || s === "error") return { status: s, error: e };
+  const s = raw.status ?? "running";
+  const e = raw.error ?? null;
+
+  if (s === "queued" || s === "running" || s === "done" || s === "error") return { status: s, error: e };
   return { status: "running", error: e };
 }
 
@@ -67,18 +85,16 @@ function anyDubRunning(job: Job | null): boolean {
 
   for (const v of Object.values(ds)) {
     if (typeof v === "string") {
-      if (v === "running") return true;
+      if (v === "queued" || v === "running") return true;
     } else if (v && typeof v === "object") {
-      if ((v as any).status === "running") return true;
+      if (v.status === "queued" || v.status === "running") return true;
     }
   }
   return false;
 }
 
 function safeOpen(url: string) {
-  if (typeof window !== "undefined") {
-    window.open(url, "_blank", "noopener,noreferrer");
-  }
+  if (typeof window !== "undefined") window.open(url, "_blank", "noopener,noreferrer");
 }
 
 export default function JobClient({
@@ -89,108 +105,104 @@ export default function JobClient({
   onCreditsChanged?: () => void;
 }) {
   const [ytUrl, setYtUrl] = useState("");
+
   const [jobId, setJobId] = useState<string | null>(null);
   const [job, setJob] = useState<Job | null>(null);
 
-  const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+
+  const [creating, setCreating] = useState(false);
+  const [polling, setPolling] = useState(false);
+  const [dubStarting, setDubStarting] = useState(false);
 
   const [downloading, setDownloading] = useState<AnyArtifactType | null>(null);
 
-  const [selectedLang, setSelectedLang] = useState<(typeof LANGS)[number]["code"]>("hi");
+  const [selectedLang, setSelectedLang] = useState<LangCode>("hi");
   const [captionStyle, setCaptionStyle] = useState<CaptionStyle>("clean");
 
-  const [dubBusy, setDubBusy] = useState(false);
+  const [ytConnected, setYtConnected] = useState(false);
+  const [ytConnecting, setYtConnecting] = useState(false);
 
   const [activeDubLang, setActiveDubLang] = useState<string | null>(null);
-  const [pollKey, setPollKey] = useState(0);
 
   // IMPORTANT: no "window" types here
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const busy = creating || polling || dubStarting;
 
   const canSubmit = useMemo(() => ytUrl.trim().length > 0 && !busy, [ytUrl, busy]);
 
-  function clearTimer() {
+  const clearTimer = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = null;
-  }
+  }, []);
 
-  async function getAccessToken(): Promise<string | null> {
+  const abortInFlight = useCallback(() => {
+    if (abortRef.current) abortRef.current.abort();
+    abortRef.current = null;
+  }, []);
+
+  const getAccessToken = useCallback(async (): Promise<string | null> => {
     const { data } = await supabase.auth.getSession();
     return data.session?.access_token ?? null;
-  }
+  }, []);
 
-  async function createJob() {
-    setMsg(null);
-    setBusy(true);
-    setJob(null);
-    setJobId(null);
-    setActiveDubLang(null);
-    clearTimer();
-
-    try {
-      const token = await getAccessToken();
-      if (!token) {
-        setMsg("Please sign in first.");
-        setBusy(false);
-        return;
-      }
-
-      const res = await fetch("/api/clip/submit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ url: ytUrl.trim() }),
-      });
-
-      const text = await res.text();
-      let data: any = {};
-      try {
-        data = text ? JSON.parse(text) : {};
-      } catch {}
-
-      if (!res.ok) throw new Error(String(data?.error || text || `Request failed (${res.status})`));
-
-      const id: string | undefined = data?.jobId ?? data?.id;
-      if (!id) throw new Error("Server did not return a job id");
-
-      setJobId(id);
-      setMsg("Job created. Processing...");
-      onJobCreated?.();
-      onCreditsChanged?.();
-    } catch (e: any) {
-      setMsg(e?.message || "Failed to create job");
-      setBusy(false);
-    }
-  }
-
-  async function pollOnce(id: string): Promise<Job> {
+  const refreshYTStatus = useCallback(async () => {
     const token = await getAccessToken();
-    if (!token) throw new Error("Session expired. Please sign in again.");
+    if (!token) return;
 
-    const res = await fetch(`/api/clip/status?jobId=${encodeURIComponent(id)}`, {
+    const res = await fetch("/api/youtube/status", {
       cache: "no-store",
       headers: { Authorization: `Bearer ${token}` },
     });
 
     const text = await res.text();
-    let data: any = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {}
+    const data = parseJsonSafe<any>(text) ?? {};
+    setYtConnected(!!data?.connected);
+  }, [getAccessToken]);
 
-    if (!res.ok) throw new Error(String(data?.error || text || `Request failed (${res.status})`));
-    return data as Job;
-  }
+  const pollOnce = useCallback(
+    async (id: string, signal: AbortSignal): Promise<Job> => {
+      const token = await getAccessToken();
+      if (!token) throw new Error("Session expired. Please sign in again.");
+
+      const res = await fetch(`/api/clip/status?jobId=${encodeURIComponent(id)}`, {
+        cache: "no-store",
+        headers: { Authorization: `Bearer ${token}` },
+        signal,
+      });
+
+      const text = await res.text();
+      const data = parseJsonSafe<any>(text) ?? {};
+
+      if (!res.ok) throw new Error(String(data?.error || text || `Request failed (${res.status})`));
+      return data as Job;
+    },
+    [getAccessToken]
+  );
+
+  useEffect(() => {
+    refreshYTStatus().catch(() => {});
+  }, [refreshYTStatus]);
 
   useEffect(() => {
     if (!jobId) return;
 
     const id = jobId;
+
     let alive = true;
+    clearTimer();
+    abortInFlight();
+
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     async function loop() {
       try {
-        const data = await pollOnce(id);
+        setPolling(true);
+
+        const data = await pollOnce(id, controller.signal);
         if (!alive) return;
 
         setJob(data);
@@ -201,42 +213,43 @@ export default function JobClient({
         const activeLang = activeDubLang;
         const activeLangState = activeLang ? readDubState(data, activeLang) : null;
 
-        if (
-          activeLang &&
-          activeLangState &&
-          (activeLangState.status === "done" || activeLangState.status === "error")
-        ) {
+        // Auto-clear active dub lang when terminal
+        if (activeLang && activeLangState && (activeLangState.status === "done" || activeLangState.status === "error")) {
           setActiveDubLang(null);
         }
 
         const dubStillRunning =
           anyDubRunning(data) ||
-          (activeLangState?.status === "running" || activeLangState?.status === "not_started");
+          (activeLangState?.status === "queued" || activeLangState?.status === "running");
 
         if (baseErrored) {
-          setBusy(false);
           setMsg(data.error || "Job failed");
+          setPolling(false);
           clearTimer();
           return;
         }
 
         if (!baseRunning && !dubStillRunning) {
-          setBusy(false);
           setMsg("Done. Download artifacts below. Start a dub to generate translated versions.");
+          setPolling(false);
           clearTimer();
           return;
         }
 
-        setBusy(true);
-
-        if (baseRunning) setMsg("Processing...");
-        else if (activeLang && activeLangState?.status === "running") setMsg(`Dub running for ${activeLang.toUpperCase()}...`);
+        if (baseRunning) {
+          setMsg("Processing...");
+        } else if (activeLang && activeLangState?.status && (activeLangState.status === "queued" || activeLangState.status === "running")) {
+          setMsg(`Dub running for ${activeLang.toUpperCase()}...`);
+        } else if (dubStillRunning) {
+          setMsg("Dub running...");
+        }
 
         timerRef.current = setTimeout(loop, 2000);
       } catch (e: any) {
         if (!alive) return;
+        if (e?.name === "AbortError") return;
         setMsg(e?.message || "Polling failed");
-        setBusy(false);
+        setPolling(false);
         clearTimer();
       }
     }
@@ -246,9 +259,11 @@ export default function JobClient({
     return () => {
       alive = false;
       clearTimer();
+      abortInFlight();
+      setPolling(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId, pollKey, activeDubLang]);
+  }, [jobId, activeDubLang]);
 
   async function openArtifactUrl(params: { jobId: string; type: AnyArtifactType; lang?: string }) {
     const token = await getAccessToken();
@@ -265,10 +280,7 @@ export default function JobClient({
     });
 
     const text = await res.text();
-    let data: any = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {}
+    const data = parseJsonSafe<any>(text) ?? {};
 
     if (!res.ok) throw new Error(String(data?.error || text || `Request failed (${res.status})`));
 
@@ -276,6 +288,44 @@ export default function JobClient({
     if (!url) throw new Error("No download URL returned");
 
     safeOpen(url);
+  }
+
+  async function createJob() {
+    setMsg(null);
+    setCreating(true);
+    setJob(null);
+    setJobId(null);
+    setActiveDubLang(null);
+    clearTimer();
+    abortInFlight();
+
+    try {
+      const token = await getAccessToken();
+      if (!token) throw new Error("Please sign in first.");
+
+      const res = await fetch("/api/clip/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ url: ytUrl.trim() }),
+      });
+
+      const text = await res.text();
+      const data = parseJsonSafe<any>(text) ?? {};
+
+      if (!res.ok) throw new Error(String(data?.error || text || `Request failed (${res.status})`));
+
+      const id: string | undefined = data?.jobId ?? data?.id;
+      if (!id) throw new Error("Server did not return a job id");
+
+      setJobId(id);
+      setMsg("Job created. Processing...");
+      onJobCreated?.();
+      onCreditsChanged?.();
+    } catch (e: any) {
+      setMsg(e?.message || "Failed to create job");
+    } finally {
+      setCreating(false);
+    }
   }
 
   async function downloadBase(type: BaseArtifactType) {
@@ -295,7 +345,7 @@ export default function JobClient({
     if (!jobId) return;
 
     setMsg(null);
-    setDubBusy(true);
+    setDubStarting(true);
 
     try {
       const token = await getAccessToken();
@@ -308,32 +358,27 @@ export default function JobClient({
       });
 
       const text = await res.text();
-      let data: any = {};
-      try {
-        data = text ? JSON.parse(text) : {};
-      } catch {}
+      const data = parseJsonSafe<any>(text) ?? {};
 
       if (!res.ok) throw new Error(String(data?.error || text || `Request failed (${res.status})`));
 
       setActiveDubLang(lang);
       setMsg(`Dub started for ${lang.toUpperCase()}.`);
       onCreditsChanged?.();
-
-      setPollKey((k) => k + 1);
     } catch (e: any) {
       setMsg(e?.message || "Dub start failed");
     } finally {
-      setDubBusy(false);
+      setDubStarting(false);
     }
   }
 
   async function downloadDub(kind: "video" | "audio" | "log") {
     if (!jobId) return;
+
     const type = `dub_${kind}` as DubArtifactType;
 
     setMsg(null);
     setDownloading(type);
-
     try {
       await openArtifactUrl({ jobId, type, lang: selectedLang });
     } catch (e: any) {
@@ -343,10 +388,97 @@ export default function JobClient({
     }
   }
 
+  async function connectYouTube() {
+    setMsg(null);
+    setYtConnecting(true);
+
+    try {
+      const token = await getAccessToken();
+      if (!token) throw new Error("Please sign in first.");
+
+      const res = await fetch("/api/youtube/start", {
+        cache: "no-store",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      const text = await res.text();
+      const data = parseJsonSafe<any>(text) ?? {};
+
+      if (!res.ok || !data?.url) throw new Error(String(data?.error || "Failed to start OAuth"));
+
+      const w = 520;
+      const h = 700;
+
+      // Center popup
+      const left = Math.max(0, window.screenX + (window.outerWidth - w) / 2);
+      const top = Math.max(0, window.screenY + (window.outerHeight - h) / 2);
+
+      const popup = window.open(
+        data.url,
+        "yt_oauth",
+        `width=${w},height=${h},left=${left},top=${top},noopener,noreferrer`
+      );
+
+      if (!popup) throw new Error("Popup blocked. Allow popups for this site.");
+
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          window.removeEventListener("message", onMsg);
+          reject(new Error("OAuth timed out. Please try again."));
+        }, 2 * 60 * 1000);
+
+        const onMsg = (ev: MessageEvent) => {
+          if (ev.origin !== window.location.origin) return;
+          if (ev.data?.type === "YT_OAUTH_DONE") {
+            clearTimeout(timeout);
+            window.removeEventListener("message", onMsg);
+            resolve();
+          }
+        };
+
+        window.addEventListener("message", onMsg);
+      });
+
+      await refreshYTStatus();
+      setMsg("YouTube connected.");
+    } catch (e: any) {
+      setMsg(e?.message || "YouTube connect failed");
+    } finally {
+      setYtConnecting(false);
+    }
+  }
+
   const dubState = readDubState(job, selectedLang);
+  const baseDone = job?.status === "done";
 
   return (
     <div className="w-full">
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <button
+          onClick={connectYouTube}
+          disabled={ytConnecting}
+          className="border rounded-md px-4 py-2 disabled:opacity-60"
+        >
+          {ytConnecting ? "Connecting..." : ytConnected ? "YouTube connected" : "Connect YouTube"}
+        </button>
+
+        {jobId && (
+          <button
+            className="border rounded-md px-4 py-2 disabled:opacity-60"
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(jobId);
+                setMsg("Copied job id.");
+              } catch {
+                setMsg("Copy failed.");
+              }
+            }}
+          >
+            Copy job id
+          </button>
+        )}
+      </div>
+
       <div className="flex gap-2">
         <input
           className="border rounded-md px-4 py-3 flex-1"
@@ -359,7 +491,7 @@ export default function JobClient({
           disabled={!canSubmit}
           className="rounded-md px-5 py-3 bg-black text-white disabled:opacity-50"
         >
-          {busy ? "Working..." : "Create job"}
+          {creating ? "Creating..." : polling ? "Working..." : "Create job"}
         </button>
       </div>
 
@@ -379,7 +511,7 @@ export default function JobClient({
             <p className="mt-2 text-sm text-red-700 whitespace-pre-wrap">{job.error}</p>
           )}
 
-          {job.status === "done" && (
+          {baseDone && (
             <>
               <div className="mt-4 flex flex-wrap gap-2">
                 <button
@@ -414,8 +546,8 @@ export default function JobClient({
                   <select
                     className="border rounded-md px-3 py-2 text-sm"
                     value={selectedLang}
-                    onChange={(e) => setSelectedLang(e.target.value as any)}
-                    disabled={dubBusy}
+                    onChange={(e) => setSelectedLang(e.target.value as LangCode)}
+                    disabled={dubStarting || !!downloading}
                   >
                     {LANGS.map((l) => (
                       <option key={l.code} value={l.code}>
@@ -428,7 +560,7 @@ export default function JobClient({
                     className="border rounded-md px-3 py-2 text-sm"
                     value={captionStyle}
                     onChange={(e) => setCaptionStyle(e.target.value as CaptionStyle)}
-                    disabled={dubBusy}
+                    disabled={dubStarting || !!downloading}
                   >
                     {CAPTION_STYLES.map((s) => (
                       <option key={s.id} value={s.id}>
@@ -439,10 +571,10 @@ export default function JobClient({
 
                   <button
                     onClick={() => startDub(selectedLang)}
-                    disabled={dubBusy || !!downloading}
+                    disabled={dubStarting || !!downloading}
                     className="rounded-md px-4 py-2 bg-black text-white disabled:opacity-50"
                   >
-                    {dubBusy ? "Starting..." : `Start dub (${selectedLang})`}
+                    {dubStarting ? "Starting..." : `Start dub (${selectedLang})`}
                   </button>
 
                   <span className="text-xs opacity-70">

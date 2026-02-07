@@ -2,9 +2,9 @@
 """
 ClipLingua Worker - TIMED DUB VERSION (Free-tier safe)
 
-Goal: make dubbing sound less robotic by fixing the biggest offender:
-timing. We synthesize TTS per Whisper segment, then pad/fit each segment
-to its original time window, and finally stitch everything back together.
+Goal: make dubbing sound less robotic by fixing the biggest offender: timing.
+We synthesize TTS per Whisper segment, then pad/fit each segment to its original
+time window, and finally stitch everything back together.
 
 Free-tier safe defaults:
 - DISABLE_XTTS=1 (no Coqui)
@@ -12,11 +12,11 @@ Free-tier safe defaults:
 - TTS uses edge-tts (with espeak-ng fallback)
 - Translation uses google_free (or LibreTranslate if configured)
 
-Main quality upgrades vs the earlier "improved" version:
+Main quality upgrades vs earlier versions:
 1) Segment-timed dubbing (align speech to original pacing)
 2) Avoid slowing speech down (we pad silence instead). Speed up only when needed.
 3) Better audio stitching (ffmpeg concat filter, no fragile "copy" concat)
-4) Better muxing: no infinite audio loop. We generate audio to match video length.
+4) Better muxing: no infinite audio loop. Audio is matched to video length.
 5) Small fades on each segment to reduce clicks
 """
 
@@ -31,7 +31,6 @@ import subprocess
 import re
 import wave
 import math
-import textwrap
 import numpy as np
 
 from pathlib import Path
@@ -82,269 +81,82 @@ DUB_STALE_SECONDS = int(os.getenv("DUB_STALE_SECONDS", "600"))
 ENABLE_AUDIO_NORMALIZATION = (os.getenv("ENABLE_AUDIO_NORMALIZATION") or "1").strip().lower() in {"1", "true", "yes"}
 ENABLE_SENTENCE_SPLITTING = (os.getenv("ENABLE_SENTENCE_SPLITTING") or "1").strip().lower() in {"1", "true", "yes"}
 
-# New: timed dubbing controls
+# Timed dubbing controls
 ENABLE_TIMED_DUB = (os.getenv("ENABLE_TIMED_DUB") or "1").strip().lower() in {"1", "true", "yes"}
 MAX_DUB_SEGMENTS = int(os.getenv("MAX_DUB_SEGMENTS", "140"))  # safety cap
 MERGE_GAP_SECONDS = float(os.getenv("MERGE_GAP_SECONDS", "0.18"))
 MIN_SEG_CHARS = int(os.getenv("MIN_SEG_CHARS", "10"))
 MAX_SEG_CHARS = int(os.getenv("MAX_SEG_CHARS", "220"))
-SEGMENT_FIT_TOLERANCE = float(os.getenv("SEGMENT_FIT_TOLERANCE", "1.06"))  # 6% over target is "fit enough"
+SEGMENT_FIT_TOLERANCE = float(os.getenv("SEGMENT_FIT_TOLERANCE", "1.06"))  # 6% over target is OK
 
-# Edge TTS tuning (no custom SSML; edge-tts removed full SSML support)
+# Edge TTS tuning
 EDGE_TTS_VOLUME = (os.getenv("EDGE_TTS_VOLUME") or "+0%").strip()
 EDGE_TTS_PITCH = (os.getenv("EDGE_TTS_PITCH") or "+0Hz").strip()
 
 BUILD_TAG = (os.getenv("BUILD_TAG") or "").strip() or None
 
-app = FastAPI(title="ClipLingua Worker", version="0.9.0-timed-dub")
+app = FastAPI(title="ClipLingua Worker", version="0.9.1-timed-dub")
 
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
 CAPTION_STYLE_FORCE = {"clean", "bold", "boxed", "big"}
 
-def srt_ts(sec: float) -> str:
-    sec = max(0.0, float(sec))
-    whole = math.floor(sec)
-    ms = int(round((sec - whole) * 1000.0))
-    h = int(whole // 3600)
-    m = int((whole % 3600) // 60)
-    s = int(whole % 60)
-
-    if ms >= 1000:
-        ms -= 1000
-        s += 1
-        if s >= 60:
-            s = 0
-            m += 1
-            if m >= 60:
-                m = 0
-                h += 1
-
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-def write_srt(entries: List[Dict[str, Any]], out_path: Path) -> None:
-    lines: List[str] = []
-    for i, e in enumerate(entries, start=1):
-        lines.append(str(i))
-        lines.append(f"{srt_ts(e['start'])} --> {srt_ts(e['end'])}")
-        lines.append((e.get("text") or "").strip())
-        lines.append("")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines), encoding="utf-8", errors="ignore")
-
-# --------------------------------------------------------------------------
-# Captions (robust fonts + autosize)
-# --------------------------------------------------------------------------
-
-def probe_video_size(video_in: Path) -> Tuple[int, int]:
-    """Return (w,h) or (1280,720) fallback."""
-    try:
-        ffprobe = require_bin("ffprobe")
-        rc, out = run_cmd(
-            [
-                ffprobe, "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
-                "-of", "csv=p=0:s=x",
-                str(video_in),
-            ],
-            cwd=None,
-        )
-        if rc != 0:
-            return (1280, 720)
-        val = out.strip().splitlines()[-1].strip()
-        if "x" in val:
-            w, h = val.split("x", 1)
-            return (int(w), int(h))
-        return (1280, 720)
-    except Exception:
-        return (1280, 720)
-
-def _font_exists(font_name: str) -> bool:
-    """Check if a font exists using fc-list when available."""
-    try:
-        fc = shutil.which("fc-list")
-        if not fc:
-            return False
-        rc, out = run_cmd([fc, ":family"], cwd=None)
-        if rc != 0:
-            return False
-        fams = out.lower()
-        return font_name.lower() in fams
-    except Exception:
-        return False
-
-CAPTION_FONT_PREFS = {
-    # Put Devanagari-capable fonts first for Hindi
-    "hi": [
-        os.getenv("CAPTION_FONT_HI", "").strip(),
-        "Noto Sans Devanagari",
-        "Lohit Devanagari",
-        "Mangal",
-        "Nirmala UI",
-        "DejaVu Sans",
-    ],
-    "en": [
-        os.getenv("CAPTION_FONT_EN", "").strip(),
-        "Noto Sans",
-        "DejaVu Sans",
-        "Arial",
-    ],
-    "es": [
-        os.getenv("CAPTION_FONT_ES", "").strip(),
-        "Noto Sans",
-        "DejaVu Sans",
-        "Arial",
-    ],
-}
-
-def pick_caption_font(lang: str) -> Optional[str]:
-    lang = (lang or "en").lower()
-    prefs = CAPTION_FONT_PREFS.get(lang, CAPTION_FONT_PREFS["en"])
-    prefs = [p for p in prefs if p]  # drop empty
-    # If we can detect installed fonts, pick the first that exists.
-    for f in prefs:
-        if _font_exists(f):
-            return f
-    # If we cannot detect (fc-list missing), still return a strong default.
-    # For Hindi, prefer Noto Sans Devanagari.
-    if lang == "hi":
-        return "Noto Sans Devanagari"
-    return "Noto Sans"
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-def build_caption_force_style(style_id: str, video_h: int, lang: str) -> str:
-    """
-    Auto-size based on video height but clamp so 9:16 videos do not get giant captions.
-    """
-    style_id = (style_id or "clean").lower()
-    font = pick_caption_font(lang)
-
-    # scale based on 720p baseline, but clamp for tall videos (Shorts/Reels)
-    scale = clamp(video_h / 720.0, 0.80, 1.25)
-
-    base_size = int(round(24 * scale))     # 720p ~24
-    big_size  = int(round(base_size * 1.20))
-    outline   = int(round(2 * scale))
-    outline   = max(1, min(outline, 3))
-    margin_v  = int(round(56 * scale))
-
-    # Common base: readable, not bulky
-    base = [
-        f"Fontname={font}",
-        f"Fontsize={base_size}",
-        "PrimaryColour=&H00FFFFFF",   # white
-        "OutlineColour=&H00000000",   # black
-        f"Outline={outline}",
-        "Shadow=0",
-        f"MarginV={margin_v}",
-        "Alignment=2",                # bottom-center
-        "WrapStyle=2",                # smart wrapping
-    ]
-
-    if style_id == "bold":
-        base += ["Bold=1", f"Outline={min(3, outline + 1)}"]
-    elif style_id == "boxed":
-        base += [
-            "BorderStyle=3",
-            "BackColour=&H80000000",   # 50% black
-            f"Outline={outline}",
-        ]
-    elif style_id == "big":
-        base = [x if not x.startswith("Fontsize=") else f"Fontsize={big_size}" for x in base]
-        base += ["Bold=1", f"Outline={min(3, outline + 1)}"]
-
-    return ",".join(base)
-
-def burn_captions(
-    video_in: Path,
-    srt_path: Path,
-    video_out: Path,
-    caption_style: str,
-    lang: str,
-    log_fn=None,
-) -> None:
-    ffmpeg = require_bin("ffmpeg")
-
-    # fontsdir helps libass find fonts in slim containers
-    fontsdir = (os.getenv("CAPTION_FONTS_DIR") or "/usr/share/fonts").strip()
-    _, vh = probe_video_size(video_in)
-    style = build_caption_force_style(caption_style, vh, lang)
-
-    # Escape for ffmpeg subtitles filter
-    p = str(srt_path).replace("\\", "/")
-    p = p.replace(":", "\\:").replace("'", "\\'")
-    fontsdir = fontsdir.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-
-    vf = f"subtitles='{p}':charenc=UTF-8:fontsdir='{fontsdir}':force_style='{style}'"
-
-    cmd = [
-        ffmpeg, "-y",
-        "-i", str(video_in),
-        "-vf", vf,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-c:a", "copy",
-        str(video_out),
-    ]
-    rc, out = run_cmd(cmd, cwd=None)
-    if log_fn:
-        log_fn("== ffmpeg burn captions ==")
-        log_fn(out)
-        log_fn(f"caption_font={pick_caption_font(lang)} video_h={vh} style={caption_style}")
-        log_fn(f"fontsdir={fontsdir}")
-    if rc != 0 or (not video_out.exists()) or video_out.stat().st_size < 10_000:
-        tail = "\n".join(out.splitlines()[-200:])
-        raise RuntimeError(f"burn captions failed (rc={rc})\n{tail}")
-
-def wav_duration_seconds(path: Path) -> float:
-    with wave.open(str(path), "rb") as wf:
-        frames = wf.getnframes()
-        sr = wf.getframerate()
-    return float(frames) / float(sr) if sr else 0.0
-
-def safe_move(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(src), str(dst))
-
-def make_silence_wav(duration_s: float, out_wav: Path) -> None:
-    duration_s = float(duration_s)
-    if duration_s <= 0.01:
-        raise RuntimeError("silence duration too small")
-
-    ffmpeg_bin = require_bin("ffmpeg")
-    cmd = [
-        ffmpeg_bin, "-y",
-        "-f", "lavfi",
-        "-i", f"anullsrc=r=16000:cl=mono",
-        "-t", f"{duration_s:.3f}",
-        "-ar", "16000", "-ac", "1",
-        str(out_wav),
-    ]
-    rc, out = run_cmd(cmd, cwd=None)
-    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
-        tail = "\n".join(out.splitlines()[-120:])
-        raise RuntimeError(f"make_silence_wav failed (rc={rc})\n{tail}")
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def _as_dict(v: Any) -> Dict[str, Any]:
-    if v is None:
-        return {}
-    if isinstance(v, dict):
-        return v
-    if isinstance(v, str):
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
+    proc = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return proc.returncode, proc.stdout
+
+
+def require_bin(name: str) -> str:
+    p = shutil.which(name)
+    if not p:
+        raise RuntimeError(f"missing dependency: {name} not found in PATH")
+    return p
+
+
+def wait_for_file(path: Path, min_bytes: int, tries: int = 200, sleep_s: float = 0.25) -> bool:
+    for _ in range(tries):
         try:
-            parsed = json.loads(v)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-    return {}
+            if path.exists() and path.is_file() and path.stat().st_size >= min_bytes:
+                return True
+        except FileNotFoundError:
+            pass
+        time.sleep(sleep_s)
+    return False
+
+
+def list_dir(folder: Path) -> str:
+    try:
+        items: List[str] = []
+        for p in sorted(folder.rglob("*")):
+            rel = p.relative_to(folder)
+            if p.is_dir():
+                items.append(f"[DIR]  {rel}")
+            else:
+                try:
+                    items.append(f"[FILE] {rel} ({p.stat().st_size} bytes)")
+                except Exception:
+                    items.append(f"[FILE] {rel} (size?)")
+        return "\n".join(items) if items else "<empty>"
+    except Exception as e:
+        return f"<could not list dir: {e}>"
+
 
 def ensure_writable_dir(p: Path, fallback: Path) -> Path:
     try:
@@ -357,9 +169,23 @@ def ensure_writable_dir(p: Path, fallback: Path) -> Path:
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
 
+
 DATA_DIR = ensure_writable_dir(DATA_DIR, Path("/tmp/cliplingua/data"))
 TMP_DIR = ensure_writable_dir(TMP_DIR, Path("/tmp/cliplingua/tmp"))
 JOB_STORE_DIR = ensure_writable_dir(DATA_DIR / "jobs", DATA_DIR / "jobs")
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def safe_move(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+
 
 # -----------------------------------------------------------------------------
 # Supabase client
@@ -369,10 +195,12 @@ _supabase = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     try:
         from supabase import create_client
+
         _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     except Exception as e:
         print(f"WARNING: Supabase client creation failed: {e}")
         _supabase = None
+
 
 # -----------------------------------------------------------------------------
 # Storage helpers
@@ -380,6 +208,23 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 
 def storage_key(job_id: str, filename: str) -> str:
     return f"jobs/{job_id}/{filename}"
+
+
+def sb_append_log(job_id: str, text: str) -> None:
+    if not _supabase:
+        return
+    try:
+        res = _supabase.table("clip_jobs").select("log_text").eq("id", job_id).limit(1).execute()
+        data = getattr(res, "data", None) or []
+        current = ""
+        if data and isinstance(data, list) and len(data) > 0:
+            current = data[0].get("log_text") or ""
+        updated = (current + ("" if current.endswith("\n") or current == "" else "\n") + text)
+        updated = updated[-MAX_LOG_CHARS:]
+        _supabase.table("clip_jobs").update({"log_text": updated, "updated_at": now_iso()}).eq("id", job_id).execute()
+    except Exception as e:
+        print(f"WARNING: sb_append_log failed: {e}")
+
 
 def sb_upload_file(job_id: str, local_path: Path, filename: str, content_type: str) -> Optional[str]:
     if not _supabase:
@@ -402,6 +247,7 @@ def sb_upload_file(job_id: str, local_path: Path, filename: str, content_type: s
             pass
         return None
 
+
 def sb_download_key(key: str, dest_path: Path) -> bool:
     if not _supabase or not key:
         return False
@@ -413,86 +259,37 @@ def sb_download_key(key: str, dest_path: Path) -> bool:
     except Exception:
         return False
 
+
 def sb_download_file(job_id: str, filename: str, dest_path: Path) -> bool:
     return sb_download_key(storage_key(job_id, filename), dest_path)
 
-def ensure_local_from_storage(job_id: str, job: Dict[str, Any], filename: str, local_path: Path, key_field: str) -> bool:
+
+def _as_dict(v: Any) -> Dict[str, Any]:
+    if v is None:
+        return {}
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def sb_get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    if not _supabase:
+        return None
     try:
-        if local_path.exists() and local_path.stat().st_size > 0:
-            return True
+        res = _supabase.table("clip_jobs").select("*").eq("id", job_id).limit(1).execute()
+        data = getattr(res, "data", None)
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0]
+        return None
     except Exception:
-        pass
-    key = job.get(key_field)
-    if key and sb_download_key(key, local_path):
-        return True
-    return sb_download_file(job_id, filename, local_path)
+        return None
 
-def dub_storage_keys_from_status(dub_status: Dict[str, Any], lang: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    info = _as_dict(dub_status.get(lang))
-    return (info.get("audio_key"), info.get("video_key"), info.get("log_key"))
-
-def ensure_local_dub_from_storage(job_id: str, lang: str, dub_status: Dict[str, Any], kind: str, local_path: Path) -> bool:
-    try:
-        if local_path.exists() and local_path.stat().st_size > 0:
-            return True
-    except Exception:
-        pass
-    audio_key, video_key, log_key = dub_storage_keys_from_status(dub_status, lang)
-    if kind == "audio":
-        key = audio_key
-        fallback_filename = f"dubs/{lang}/audio.wav"
-    elif kind == "video":
-        key = video_key
-        fallback_filename = f"dubs/{lang}/video.mp4"
-    else:
-        key = log_key
-        fallback_filename = f"dubs/{lang}/log.txt"
-    if key and sb_download_key(key, local_path):
-        return True
-    return sb_download_file(job_id, fallback_filename, local_path)
-
-# -----------------------------------------------------------------------------
-# Job store
-# -----------------------------------------------------------------------------
-
-def job_dir(job_id: str) -> Path:
-    return JOB_STORE_DIR / job_id
-
-def job_json_path(job_id: str) -> Path:
-    return job_dir(job_id) / "job.json"
-
-def atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
-
-def save_job_local(job_id: str, payload: Dict[str, Any]) -> None:
-    atomic_write_text(job_json_path(job_id), json.dumps(payload, indent=2))
-
-def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
-    if not PUBLIC_BASE_URL:
-        return {"video_url": None, "audio_url": None, "log_url": None}
-    return {
-        "video_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/video",
-        "audio_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/audio",
-        "log_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/log",
-    }
-
-def load_job_local(job_id: str) -> Optional[Dict[str, Any]]:
-    p = job_json_path(job_id)
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    legacy = DATA_DIR / f"{job_id}.json"
-    if legacy.exists():
-        job = json.loads(legacy.read_text(encoding="utf-8"))
-        jd = job_dir(job_id)
-        jd.mkdir(parents=True, exist_ok=True)
-        job.setdefault("id", job_id)
-        job.update(_artifact_urls(job_id))
-        save_job_local(job_id, job)
-        return job
-    return None
 
 def sb_upsert_job(job_id: str, payload: Dict[str, Any]) -> None:
     if not _supabase:
@@ -518,33 +315,6 @@ def sb_upsert_job(job_id: str, payload: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"WARNING: sb_upsert_job failed: {e}")
 
-def sb_get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    if not _supabase:
-        return None
-    try:
-        res = _supabase.table("clip_jobs").select("*").eq("id", job_id).limit(1).execute()
-        data = getattr(res, "data", None)
-        if data and isinstance(data, list) and len(data) > 0:
-            return data[0]
-        return None
-    except Exception:
-        return None
-
-def sb_append_log(job_id: str, text: str) -> None:
-    if not _supabase:
-        return
-    try:
-        res = _supabase.table("clip_jobs").select("log_text").eq("id", job_id).limit(1).execute()
-        data = getattr(res, "data", None) or []
-        current = ""
-        if data and isinstance(data, list) and len(data) > 0:
-            current = data[0].get("log_text") or ""
-        updated = (current + ("" if current.endswith("\n") or current == "" else "\n") + text)
-        updated = updated[-MAX_LOG_CHARS:]
-
-        _supabase.table("clip_jobs").update({"log_text": updated, "updated_at": now_iso()}).eq("id", job_id).execute()
-    except Exception as e:
-        print(f"WARNING: sb_append_log failed: {e}")
 
 def sb_get_log(job_id: str) -> Optional[str]:
     if not _supabase:
@@ -561,6 +331,7 @@ def sb_get_log(job_id: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def sb_get_dub_status_map(job_id: str) -> Dict[str, Any]:
     if not _supabase:
         return {}
@@ -573,6 +344,7 @@ def sb_get_dub_status_map(job_id: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+
 def sb_upsert_dub_status(
     job_id: str,
     lang: str,
@@ -581,6 +353,7 @@ def sb_upsert_dub_status(
     audio_key: Optional[str] = None,
     video_key: Optional[str] = None,
     log_key: Optional[str] = None,
+    srt_key: Optional[str] = None,
 ) -> None:
     if not _supabase:
         return
@@ -594,10 +367,13 @@ def sb_upsert_dub_status(
             prev["video_key"] = video_key
         if log_key:
             prev["log_key"] = log_key
+        if srt_key:
+            prev["srt_key"] = srt_key
         current[lang] = prev
         _supabase.table("clip_jobs").update({"dub_status": current, "updated_at": now_iso()}).eq("id", job_id).execute()
     except Exception as e:
         print(f"WARNING: sb_upsert_dub_status failed: {e}")
+
 
 def sb_get_dub_log_text(job_id: str, lang: str) -> Optional[str]:
     if not _supabase:
@@ -612,23 +388,66 @@ def sb_get_dub_log_text(job_id: str, lang: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def sb_append_dub_log(job_id: str, lang: str, line: str) -> None:
     if not _supabase:
         return
     try:
         res = _supabase.table("clip_jobs").select("dub_log_text").eq("id", job_id).limit(1).execute()
         data = getattr(res, "data", None) or []
-        current = {}
+        current: Dict[str, Any] = {}
         if data and isinstance(data, list) and len(data) > 0:
             current = _as_dict(data[0].get("dub_log_text"))
         prev = current.get(lang) or ""
         updated = (prev + ("" if prev.endswith("\n") or prev == "" else "\n") + line.rstrip())
         updated = updated[-MAX_LOG_CHARS:]
-
         current[lang] = updated
         _supabase.table("clip_jobs").update({"dub_log_text": current, "updated_at": now_iso()}).eq("id", job_id).execute()
     except Exception as e:
         print(f"WARNING: sb_append_dub_log failed: {e}")
+
+
+# -----------------------------------------------------------------------------
+# Job store (local)
+# -----------------------------------------------------------------------------
+
+def job_dir(job_id: str) -> Path:
+    return JOB_STORE_DIR / job_id
+
+
+def job_json_path(job_id: str) -> Path:
+    return job_dir(job_id) / "job.json"
+
+
+def save_job_local(job_id: str, payload: Dict[str, Any]) -> None:
+    atomic_write_text(job_json_path(job_id), json.dumps(payload, indent=2))
+
+
+def _artifact_urls(job_id: str) -> Dict[str, Optional[str]]:
+    if not PUBLIC_BASE_URL:
+        return {"video_url": None, "audio_url": None, "log_url": None}
+    return {
+        "video_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/video",
+        "audio_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/audio",
+        "log_url": f"{PUBLIC_BASE_URL}/jobs/{job_id}/log",
+    }
+
+
+def load_job_local(job_id: str) -> Optional[Dict[str, Any]]:
+    p = job_json_path(job_id)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    legacy = DATA_DIR / f"{job_id}.json"
+    if legacy.exists():
+        job = json.loads(legacy.read_text(encoding="utf-8"))
+        jd = job_dir(job_id)
+        jd.mkdir(parents=True, exist_ok=True)
+        job.setdefault("id", job_id)
+        job.update(_artifact_urls(job_id))
+        save_job_local(job_id, job)
+        return job
+    return None
+
 
 def load_job(job_id: str) -> Dict[str, Any]:
     sb = sb_get_job(job_id)
@@ -653,6 +472,7 @@ def load_job(job_id: str) -> Dict[str, Any]:
     if local:
         return local
     raise HTTPException(status_code=404, detail="job not found")
+
 
 def update_job(job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
     local = load_job_local(job_id)
@@ -682,6 +502,7 @@ def update_job(job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
     sb_upsert_job(job_id, local)
     return local
 
+
 # -----------------------------------------------------------------------------
 # Models
 # -----------------------------------------------------------------------------
@@ -689,16 +510,469 @@ def update_job(job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
 @lru_cache(maxsize=1)
 def _get_whisper():
     from faster_whisper import WhisperModel
+
     return WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 
+
+@lru_cache(maxsize=1)
 def _get_nllb():
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
     tok = AutoTokenizer.from_pretrained(NLLB_MODEL)
     model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL)
     return tok, model
 
+
 # -----------------------------------------------------------------------------
-# Utilities
+# Captions (robust fonts + autosize)
+# -----------------------------------------------------------------------------
+
+def probe_video_size(video_in: Path) -> Tuple[int, int]:
+    """Return (w,h) or (1280,720) fallback."""
+    try:
+        ffprobe = require_bin("ffprobe")
+        rc, out = run_cmd(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0:s=x",
+                str(video_in),
+            ],
+            cwd=None,
+        )
+        if rc != 0:
+            return (1280, 720)
+        val = out.strip().splitlines()[-1].strip()
+        if "x" in val:
+            w, h = val.split("x", 1)
+            return (int(w), int(h))
+        return (1280, 720)
+    except Exception:
+        return (1280, 720)
+
+
+def _font_exists(font_name: str) -> bool:
+    try:
+        fc = shutil.which("fc-list")
+        if not fc:
+            return False
+        rc, out = run_cmd([fc, ":family"], cwd=None)
+        if rc != 0:
+            return False
+        return font_name.lower() in out.lower()
+    except Exception:
+        return False
+
+
+CAPTION_FONT_PREFS = {
+    "hi": [
+        os.getenv("CAPTION_FONT_HI", "").strip(),
+        "Noto Sans Devanagari",
+        "Lohit Devanagari",
+        "Mangal",
+        "Nirmala UI",
+        "DejaVu Sans",
+    ],
+    "en": [
+        os.getenv("CAPTION_FONT_EN", "").strip(),
+        "Noto Sans",
+        "DejaVu Sans",
+        "Arial",
+    ],
+    "es": [
+        os.getenv("CAPTION_FONT_ES", "").strip(),
+        "Noto Sans",
+        "DejaVu Sans",
+        "Arial",
+    ],
+}
+
+
+def pick_caption_font(lang: str) -> str:
+    lang = (lang or "en").lower()
+    prefs = [p for p in CAPTION_FONT_PREFS.get(lang, CAPTION_FONT_PREFS["en"]) if p]
+    for f in prefs:
+        if _font_exists(f):
+            return f
+    if lang == "hi":
+        return "Noto Sans Devanagari"
+    return "Noto Sans"
+
+
+def build_caption_force_style(style_id: str, video_h: int, lang: str) -> str:
+    style_id = (style_id or "clean").lower()
+    font = pick_caption_font(lang)
+
+    # Scale based on 720p baseline, clamp for tall videos (Shorts/Reels)
+    scale = clamp(video_h / 720.0, 0.85, 1.30)
+
+    base_size = int(round(24 * scale))
+    big_size = int(round(base_size * 1.25))
+    outline = int(round(2 * scale))
+    outline = max(1, min(outline, 4))
+    margin_v = int(round(56 * scale))
+
+    base = [
+        f"Fontname={font}",
+        f"Fontsize={base_size}",
+        "PrimaryColour=&H00FFFFFF",
+        "OutlineColour=&H00000000",
+        f"Outline={outline}",
+        "Shadow=0",
+        f"MarginV={margin_v}",
+        "Alignment=2",
+        "WrapStyle=2",
+    ]
+
+    if style_id == "bold":
+        base += ["Bold=1", f"Outline={min(4, outline + 1)}"]
+    elif style_id == "boxed":
+        base += [
+            "BorderStyle=3",
+            "BackColour=&H80000000",
+            f"Outline={outline}",
+        ]
+    elif style_id == "big":
+        base = [x if not x.startswith("Fontsize=") else f"Fontsize={big_size}" for x in base]
+        base += ["Bold=1", f"Outline={min(4, outline + 1)}"]
+
+    return ",".join(base)
+
+
+def srt_ts(sec: float) -> str:
+    sec = max(0.0, float(sec))
+    whole = math.floor(sec)
+    ms = int(round((sec - whole) * 1000.0))
+    h = int(whole // 3600)
+    m = int((whole % 3600) // 60)
+    s = int(whole % 60)
+
+    if ms >= 1000:
+        ms -= 1000
+        s += 1
+        if s >= 60:
+            s = 0
+            m += 1
+            if m >= 60:
+                m = 0
+                h += 1
+
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def write_srt(entries: List[Dict[str, Any]], out_path: Path) -> None:
+    lines: List[str] = []
+    for i, e in enumerate(entries, start=1):
+        lines.append(str(i))
+        lines.append(f"{srt_ts(e['start'])} --> {srt_ts(e['end'])}")
+        lines.append((e.get("text") or "").strip())
+        lines.append("")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines), encoding="utf-8", errors="ignore")
+
+
+def burn_captions(
+    video_in: Path,
+    srt_path: Path,
+    video_out: Path,
+    caption_style: str,
+    lang: str,
+    log_fn=None,
+) -> None:
+    ffmpeg = require_bin("ffmpeg")
+
+    fontsdir = (os.getenv("CAPTION_FONTS_DIR") or "/usr/share/fonts").strip()
+    _, vh = probe_video_size(video_in)
+    style = build_caption_force_style(caption_style, vh, lang)
+
+    p = str(srt_path).replace("\\", "/")
+    p = p.replace(":", "\\:").replace("'", "\\'")
+    fontsdir_esc = fontsdir.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+    vf = f"subtitles='{p}':charenc=UTF-8:fontsdir='{fontsdir_esc}':force_style='{style}'"
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(video_in),
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "copy",
+        str(video_out),
+    ]
+    rc, out = run_cmd(cmd, cwd=None)
+    if log_fn:
+        log_fn("== ffmpeg burn captions ==")
+        log_fn(out)
+        log_fn(f"caption_font={pick_caption_font(lang)} video_h={vh} style={caption_style}")
+        log_fn(f"fontsdir={fontsdir}")
+    if rc != 0 or (not video_out.exists()) or video_out.stat().st_size < 10_000:
+        tail = "\n".join(out.splitlines()[-200:])
+        raise RuntimeError(f"burn captions failed (rc={rc})\n{tail}")
+
+
+# -----------------------------------------------------------------------------
+# Audio helpers
+# -----------------------------------------------------------------------------
+
+def wav_duration_seconds(path: Path) -> float:
+    with wave.open(str(path), "rb") as wf:
+        frames = wf.getnframes()
+        sr = wf.getframerate()
+    return float(frames) / float(sr) if sr else 0.0
+
+
+def make_silence_wav(duration_s: float, out_wav: Path) -> None:
+    duration_s = float(duration_s)
+    if duration_s <= 0.01:
+        raise RuntimeError("silence duration too small")
+
+    ffmpeg_bin = require_bin("ffmpeg")
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=16000:cl=mono",
+        "-t",
+        f"{duration_s:.3f}",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        str(out_wav),
+    ]
+    rc, out = run_cmd(cmd, cwd=None)
+    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
+        tail = "\n".join(out.splitlines()[-120:])
+        raise RuntimeError(f"make_silence_wav failed (rc={rc})\n{tail}")
+
+
+def atempo_chain(factor: float) -> str:
+    if factor <= 0:
+        return "atempo=1.0"
+    parts: List[float] = []
+    f = factor
+    while f > 2.0:
+        parts.append(2.0)
+        f /= 2.0
+    while f < 0.5:
+        parts.append(0.5)
+        f /= 0.5
+    parts.append(f)
+    return ",".join([f"atempo={p:.4f}" for p in parts])
+
+
+def stretch_or_pad_to_duration(in_wav: Path, out_wav: Path, target_sec: float, log_fn=None) -> None:
+    """
+    Keep speech natural:
+    - If audio is shorter: do NOT slow it down. Just pad silence.
+    - If audio is longer: speed up to fit (atempo), then trim to target.
+    Always produce exactly target_sec duration.
+    """
+    ffmpeg = require_bin("ffmpeg")
+    d_in = max(0.001, wav_duration_seconds(in_wav))
+    target = max(0.05, float(target_sec))
+
+    if d_in > target:
+        tempo = d_in / target
+        af = f"{atempo_chain(tempo)},apad"
+    else:
+        af = "apad"
+
+    fade_d = min(0.03, target / 4.0)
+    if fade_d > 0.005:
+        st_out = max(0.0, target - fade_d)
+        af = f"{af},afade=t=in:st=0:d={fade_d:.4f},afade=t=out:st={st_out:.4f}:d={fade_d:.4f}"
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(in_wav),
+        "-af",
+        af,
+        "-t",
+        f"{target:.4f}",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(out_wav),
+    ]
+    rc, out = run_cmd(cmd, cwd=None)
+    if log_fn:
+        log_fn(out)
+    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
+        tail = "\n".join(out.splitlines()[-200:])
+        raise RuntimeError(f"segment fit failed (rc={rc})\n{tail}")
+
+
+def ffmpeg_concat_wavs(inputs: List[Path], out_wav: Path, log_fn=None) -> None:
+    if not inputs:
+        raise RuntimeError("concat: no inputs")
+    if len(inputs) == 1:
+        safe_move(inputs[0], out_wav)
+        return
+
+    ffmpeg = require_bin("ffmpeg")
+    args = [ffmpeg, "-y"]
+    for p in inputs:
+        args += ["-i", str(p)]
+
+    n = len(inputs)
+    filter_str = "".join([f"[{i}:a]" for i in range(n)]) + f"concat=n={n}:v=0:a=1[a]"
+
+    args += ["-filter_complex", filter_str, "-map", "[a]", "-ac", "1", "-ar", "16000", str(out_wav)]
+    rc, out = run_cmd(args, cwd=None)
+    if log_fn:
+        log_fn(out)
+    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
+        tail = "\n".join(out.splitlines()[-200:])
+        raise RuntimeError(f"concat failed (rc={rc})\n{tail}")
+
+
+def normalize_audio(audio_path: Path, log_fn=None) -> None:
+    if not ENABLE_AUDIO_NORMALIZATION:
+        return
+    try:
+        ffmpeg_bin = require_bin("ffmpeg")
+        normalized = audio_path.with_suffix(".normalized.wav")
+        rc, out = run_cmd(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                str(audio_path),
+                "-af",
+                "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                str(normalized),
+            ],
+            cwd=None,
+        )
+        if rc == 0 and normalized.exists() and normalized.stat().st_size > 2048:
+            normalized.replace(audio_path)
+            if log_fn:
+                log_fn("audio_normalized=true")
+        else:
+            if log_fn:
+                log_fn("audio_normalized=false (non-critical)")
+    except Exception as e:
+        if log_fn:
+            log_fn(f"audio_normalized_error={e} (non-critical)")
+
+
+def mux_audio_into_video(video_in: Path, audio_in: Path, video_out: Path, log_fn=None) -> None:
+    ffmpeg = require_bin("ffmpeg")
+    video_out.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(video_in),
+        "-i",
+        str(audio_in),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-shortest",
+        str(video_out),
+    ]
+    rc, out = run_cmd(cmd, cwd=None)
+    if log_fn:
+        log_fn("== ffmpeg mux ==")
+        log_fn(out)
+    if rc != 0:
+        tail = "\n".join(out.splitlines()[-200:])
+        raise RuntimeError(f"ffmpeg mux failed (rc={rc})\n{tail}")
+
+
+def video_duration_seconds(p: Path) -> Optional[float]:
+    try:
+        ffprobe = require_bin("ffprobe")
+        rc, out = run_cmd(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                str(p),
+            ],
+            cwd=None,
+        )
+        if rc != 0:
+            return None
+        val = out.strip().splitlines()[-1].strip()
+        return float(val)
+    except Exception:
+        return None
+
+
+def pad_or_trim_to_video_length(dub_wav: Path, video_in: Path, out_wav: Path, log_fn=None) -> None:
+    vd = video_duration_seconds(video_in)
+    if vd is None or vd <= 0:
+        if log_fn:
+            log_fn("video_duration_unknown=true; skipping final pad/trim")
+        dub_wav.replace(out_wav)
+        return
+
+    ffmpeg = require_bin("ffmpeg")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(dub_wav),
+        "-af",
+        "apad",
+        "-t",
+        f"{vd:.4f}",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(out_wav),
+    ]
+    rc, out = run_cmd(cmd, cwd=None)
+    if log_fn:
+        log_fn(f"final_audio_target_sec={vd:.4f}")
+        log_fn(out)
+    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
+        tail = "\n".join(out.splitlines()[-200:])
+        raise RuntimeError(f"final pad/trim failed (rc={rc})\n{tail}")
+
+
+# -----------------------------------------------------------------------------
+# Pitch and gender heuristic
 # -----------------------------------------------------------------------------
 
 def _read_wav_mono(path: Path) -> Tuple[np.ndarray, int]:
@@ -713,16 +987,11 @@ def _read_wav_mono(path: Path) -> Tuple[np.ndarray, int]:
         x = x.reshape(-1, ch).mean(axis=1)
     return x, sr
 
+
 def estimate_median_f0(audio_wav: Path, sr_expected: int = 16000) -> Optional[float]:
-    """
-    Lightweight pitch estimate via autocorrelation.
-    Works fine for voice and avoids heavy deps.
-    Returns median F0 in Hz or None.
-    """
     try:
         x, sr = _read_wav_mono(audio_wav)
         if sr != sr_expected:
-            # your pipeline already outputs 16k mono, so normally not needed
             sr = sr_expected
 
         if x.size < sr * 1:
@@ -742,13 +1011,12 @@ def estimate_median_f0(audio_wav: Path, sr_expected: int = 16000) -> Optional[fl
         max_lag = int(sr / min_hz)
 
         for i in range(0, len(x) - frame, hop):
-            w = x[i:i + frame]
+            w = x[i : i + frame]
             w = w - float(w.mean())
             energy = float(np.mean(w * w))
             if energy < 1e-5:
                 continue
 
-            # FFT autocorr
             n = len(w)
             fft = np.fft.rfft(w, n=2 * n)
             ac = np.fft.irfft(fft * np.conj(fft))[:n]
@@ -777,13 +1045,8 @@ def estimate_median_f0(audio_wav: Path, sr_expected: int = 16000) -> Optional[fl
     except Exception:
         return None
 
+
 def infer_gender_from_f0(f0_hz: Optional[float]) -> str:
-    """
-    Safer heuristic:
-    - < 145 Hz: likely male
-    - > 190 Hz: likely female
-    - between: unknown (avoid wrong flips)
-    """
     if not f0_hz:
         return "unknown"
     if f0_hz < 145.0:
@@ -792,75 +1055,377 @@ def infer_gender_from_f0(f0_hz: Optional[float]) -> str:
         return "female"
     return "unknown"
 
-def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    return proc.returncode, proc.stdout
 
-def wait_for_file(path: Path, min_bytes: int, tries: int = 200, sleep_s: float = 0.25) -> bool:
-    for _ in range(tries):
+# -----------------------------------------------------------------------------
+# Transcribe + translate
+# -----------------------------------------------------------------------------
+
+def whisper_transcribe(audio_path: Path) -> Dict[str, Any]:
+    whisper = _get_whisper()
+    segments, info = whisper.transcribe(str(audio_path), beam_size=2)
+    seg_list: List[Dict[str, Any]] = []
+    full: List[str] = []
+    for s in segments:
+        seg_list.append({"start": float(s.start), "end": float(s.end), "text": (s.text or "")})
+        txt = (s.text or "").strip()
+        if txt:
+            full.append(txt)
+    return {"language": getattr(info, "language", None), "text": " ".join(full), "segments": seg_list}
+
+
+def _truncate(s: str, n: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= n:
+        return s
+    head = s[:n]
+    return head.rsplit(" ", 1)[0] if " " in head else head
+
+
+def clean_text_for_translation(text: str) -> str:
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\.{2,}", ".", text)
+    text = re.sub(r"([.!?])\1+", r"\1", text)
+    return text.strip()
+
+
+def split_into_sentences(text: str) -> List[str]:
+    sentences = re.split(r"([.!?]+\s+)", text)
+    result: List[str] = []
+    for i in range(0, len(sentences) - 1, 2):
+        sent = sentences[i] + (sentences[i + 1] if i + 1 < len(sentences) else "")
+        sent = sent.strip()
+        if sent:
+            result.append(sent)
+    if not result and text.strip():
+        result = [text.strip()]
+    return result
+
+
+_translate_cache: Dict[str, str] = {}
+
+
+def translate_text(text: str, target_lang: str) -> str:
+    text = _truncate(text, MAX_TRANSCRIPT_CHARS)
+    text = clean_text_for_translation(text)
+    if not text:
+        return ""
+    if target_lang == "en":
+        return text
+
+    cache_key = f"{target_lang}::{text}"
+    if cache_key in _translate_cache:
+        return _translate_cache[cache_key]
+
+    try:
+        if ENABLE_LOCAL_NLLB:
+            tok, model = _get_nllb()
+            tgt_map = {"en": "eng_Latn", "hi": "hin_Deva", "es": "spa_Latn"}
+            tgt = tgt_map.get(target_lang)
+            if not tgt:
+                _translate_cache[cache_key] = text
+                return text
+            inputs = tok(text, return_tensors="pt", truncation=True, max_length=1024)
+            forced_bos = tok.convert_tokens_to_ids(tgt)
+            out = model.generate(**inputs, forced_bos_token_id=forced_bos, max_new_tokens=512)
+            translated = tok.batch_decode(out, skip_special_tokens=True)[0].strip()
+            _translate_cache[cache_key] = translated
+            return translated
+
+        if TRANSLATE_PROVIDER == "libretranslate":
+            base = (os.getenv("LIBRETRANSLATE_URL") or "").strip().rstrip("/")
+            if not base:
+                raise RuntimeError("LIBRETRANSLATE_URL not set")
+            api_key = (os.getenv("LIBRETRANSLATE_API_KEY") or "").strip()
+            payload = {"q": text, "source": "auto", "target": target_lang, "format": "text"}
+            if api_key:
+                payload["api_key"] = api_key
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url=f"{base}/translate", data=data, headers={"Content-Type": "application/json"}, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+            out = json.loads(body)
+            translated = (out.get("translatedText") or "").strip()
+            _translate_cache[cache_key] = translated
+            return translated
+
+        # Default: google_free
+        q = urllib.parse.quote(text)
+        url = (
+            "https://translate.googleapis.com/translate_a/single"
+            f"?client=gtx&sl=auto&tl={urllib.parse.quote(target_lang)}&dt=t&q={q}"
+        )
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        arr = json.loads(raw)
+        translated = "".join([chunk[0] for chunk in arr[0] if chunk and chunk[0]]).strip()
+        _translate_cache[cache_key] = translated
+        return translated
+    except Exception:
+        # Never hard-fail dubbing due to translation provider issues
+        _translate_cache[cache_key] = text
+        return text
+
+
+# -----------------------------------------------------------------------------
+# TTS
+# -----------------------------------------------------------------------------
+
+import asyncio
+
+
+def _edge_voice_for(lang: str, gender: str = "unknown") -> str:
+    """
+    gender: male | female | unknown
+    Uses per-gender env vars when set, else falls back to per-lang defaults.
+    """
+    lang = (lang or "en").lower()
+    gender = (gender or "unknown").lower()
+
+    key_map = {
+        ("hi", "male"): "EDGE_TTS_VOICE_HI_MALE",
+        ("hi", "female"): "EDGE_TTS_VOICE_HI_FEMALE",
+        ("en", "male"): "EDGE_TTS_VOICE_EN_MALE",
+        ("en", "female"): "EDGE_TTS_VOICE_EN_FEMALE",
+        ("es", "male"): "EDGE_TTS_VOICE_ES_MALE",
+        ("es", "female"): "EDGE_TTS_VOICE_ES_FEMALE",
+    }
+
+    fallback_env = {
+        "hi": os.getenv("EDGE_TTS_VOICE_HI", "hi-IN-MadhurNeural"),
+        "en": os.getenv("EDGE_TTS_VOICE_EN", "en-IN-PrabhatNeural"),
+        "es": os.getenv("EDGE_TTS_VOICE_ES", "es-ES-ElviraNeural"),
+    }
+
+    defaults = {
+        ("hi", "male"): "hi-IN-MadhurNeural",
+        ("hi", "female"): "hi-IN-SwaraNeural",
+        ("en", "male"): "en-IN-PrabhatNeural",
+        ("en", "female"): "en-IN-NeerjaNeural",
+        ("es", "male"): "es-ES-AlvaroNeural",
+        ("es", "female"): "es-ES-ElviraNeural",
+    }
+
+    env_key = key_map.get((lang, gender))
+    if env_key:
+        v = (os.getenv(env_key) or "").strip()
+        if v:
+            return v
+
+    if gender == "unknown":
+        return fallback_env.get(lang, fallback_env["en"])
+
+    return defaults.get((lang, gender), fallback_env.get(lang, fallback_env["en"]))
+
+
+def _base_rate_for_lang(lang: str) -> str:
+    rates = {
+        "hi": os.getenv("EDGE_TTS_RATE_HI", os.getenv("EDGE_TTS_RATE", "-5%")),
+        "en": os.getenv("EDGE_TTS_RATE_EN", os.getenv("EDGE_TTS_RATE", "+0%")),
+        "es": os.getenv("EDGE_TTS_RATE_ES", os.getenv("EDGE_TTS_RATE", "+0%")),
+    }
+    return rates.get(lang, os.getenv("EDGE_TTS_RATE", "+0%"))
+
+
+def _rate_candidates(base_rate: str) -> List[str]:
+    return [base_rate, "+10%", "+20%", "+30%", "+40%"]
+
+
+def _safe_text_for_tts(text: str) -> str:
+    text = clean_text_for_translation(text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r"([,.;:!?])([A-Za-z])", r"\1 \2", text)
+    return text.strip()
+
+
+async def _edge_tts_to_mp3_async(
+    text: str, lang: str, out_mp3: Path, rate: str, volume: str, pitch: str, gender: str = "unknown"
+) -> None:
+    import edge_tts
+
+    out_mp3.parent.mkdir(parents=True, exist_ok=True)
+    voice = _edge_voice_for(lang, gender)
+    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, volume=volume, pitch=pitch)
+    await communicate.save(str(out_mp3))
+
+    if not out_mp3.exists() or out_mp3.stat().st_size < 1024:
+        raise RuntimeError("edge-tts produced empty audio")
+
+
+def _run_async(coro):
+    # Safe for threads and avoids "asyncio.run in running loop" issues.
+    try:
+        asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
         try:
-            if path.exists() and path.is_file() and path.stat().st_size >= min_bytes:
-                return True
-        except FileNotFoundError:
-            pass
-        time.sleep(sleep_s)
-    return False
+            loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
-def list_dir(folder: Path) -> str:
-    try:
-        items: List[str] = []
-        for p in sorted(folder.rglob("*")):
-            rel = p.relative_to(folder)
-            if p.is_dir():
-                items.append(f"[DIR]  {rel}")
+
+def tts_edge(text: str, lang: str, out_wav: Path, rate: str, log_fn=None, gender: str = "unknown") -> None:
+    text = _safe_text_for_tts(text)
+    if not text:
+        raise RuntimeError("TTS text empty")
+
+    tmp_mp3 = out_wav.with_suffix(".mp3")
+    _run_async(_edge_tts_to_mp3_async(text, lang, tmp_mp3, rate=rate, volume=EDGE_TTS_VOLUME, pitch=EDGE_TTS_PITCH, gender=gender))
+
+    ffmpeg_bin = require_bin("ffmpeg")
+    cmd = [ffmpeg_bin, "-y", "-i", str(tmp_mp3), "-ac", "1", "-ar", "16000", str(out_wav)]
+    rc, out = run_cmd(cmd, cwd=None)
+    tmp_mp3.unlink(missing_ok=True)
+
+    if log_fn:
+        log_fn(out)
+    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
+        tail = "\n".join(out.splitlines()[-200:])
+        raise RuntimeError(f"ffmpeg convert failed (rc={rc})\n{tail}")
+
+
+def _espeak_voice_for(lang: str) -> str:
+    return {"hi": "hi", "en": "en-us", "es": "es"}.get(lang, "en-us")
+
+
+def tts_espeak(text: str, lang: str, out_wav: Path) -> None:
+    text = _safe_text_for_tts(text)
+    voice = _espeak_voice_for(lang)
+    tmp = out_wav.with_suffix(".espeak.wav")
+    cmd = ["espeak-ng", "-v", voice, "-w", str(tmp), "--stdin"]
+    proc = subprocess.run(cmd, input=text, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"espeak-ng failed (rc={proc.returncode})\n{proc.stdout[-2000:]}")
+    ffmpeg_bin = require_bin("ffmpeg")
+    rc, out = run_cmd([ffmpeg_bin, "-y", "-i", str(tmp), "-ac", "1", "-ar", "16000", str(out_wav)], cwd=None)
+    tmp.unlink(missing_ok=True)
+    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
+        tail = "\n".join(out.splitlines()[-200:])
+        raise RuntimeError(f"ffmpeg convert failed (rc={rc})\n{tail}")
+
+
+def tts_speak(text: str, lang: str, out_wav: Path, log_fn=None, gender: str = "unknown") -> None:
+    """
+    Non-timed fallback: sentence splitting + stitch.
+    Timed dubbing uses a different path (segment-based).
+    """
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("TTS text empty")
+
+    provider = (os.getenv("TTS_PROVIDER") or "auto").strip().lower()
+
+    if ENABLE_SENTENCE_SPLITTING and len(text) > 200:
+        sentences = split_into_sentences(text)
+        if log_fn:
+            log_fn(f"split_sentences={len(sentences)}")
+
+        temp_wavs: List[Path] = []
+        for i, sentence in enumerate(sentences):
+            if not sentence.strip():
+                continue
+            tmp_wav = out_wav.with_suffix(f".sent{i}.wav")
+
+            def try_edge():
+                tts_edge(sentence, lang, tmp_wav, rate=_base_rate_for_lang(lang), log_fn=None, gender=gender)
+
+            def try_espeak():
+                tts_espeak(sentence, lang, tmp_wav)
+
+            attempts: List[Tuple[str, Any]] = []
+            if provider == "edge":
+                attempts = [("edge", try_edge)]
+            elif provider == "espeak":
+                attempts = [("espeak", try_espeak)]
             else:
+                attempts = [("edge", try_edge), ("espeak", try_espeak)]
+
+            success = False
+            for name, fn in attempts:
                 try:
-                    items.append(f"[FILE] {rel} ({p.stat().st_size} bytes)")
-                except Exception:
-                    items.append(f"[FILE] {rel} (size?)")
-        return "\n".join(items) if items else "<empty>"
-    except Exception as e:
-        return f"<could not list dir: {e}>"
+                    fn()
+                    temp_wavs.append(tmp_wav)
+                    success = True
+                    break
+                except Exception as e:
+                    if log_fn:
+                        log_fn(f"sentence_tts_failed idx={i} provider={name} err={e}")
 
-def require_bin(name: str) -> str:
-    p = shutil.which(name)
-    if not p:
-        raise RuntimeError(f"missing dependency: {name} not found in PATH")
-    return p
+            if not success:
+                raise RuntimeError(f"Failed to generate TTS for sentence {i+1}")
 
-def yt_dlp_supports(yt_dlp_bin: str, flag: str) -> bool:
-    rc, out = run_cmd([yt_dlp_bin, "--help"], cwd=None)
-    return rc == 0 and (flag in out)
+        ffmpeg_concat_wavs(temp_wavs, out_wav, log_fn=log_fn)
+        for w in temp_wavs:
+            w.unlink(missing_ok=True)
+        return
 
-def materialize_cookies(tmp_job_dir: Path, log_lines: List[str]) -> Optional[Path]:
-    # Supports either a mounted cookies file path OR base64 content
-    pth = (os.getenv("YTDLP_COOKIES_PATH") or "").strip()
-    if pth:
-        cp = Path(pth)
-        if cp.exists() and cp.stat().st_size > 10:
-            log_lines.append(f"cookies=path:{cp}")
-            return cp
-        log_lines.append("cookies_path_invalid")
-    b64 = (os.getenv("YTDLP_COOKIES_B64") or "").strip()
-    if not b64:
-        log_lines.append("cookies=none")
-        return None
-    try:
-        cookies_path = tmp_job_dir / "cookies.txt"
-        raw = base64.b64decode(b64.encode("utf-8"))
-        cookies_path.write_bytes(raw)
-        os.chmod(cookies_path, 0o600)
-        log_lines.append("cookies=materialized_b64")
-        return cookies_path
-    except Exception as e:
-        log_lines.append(f"cookies_error={e}")
-        return None
+    last = None
+    if provider in {"auto", "edge"}:
+        try:
+            tts_edge(text, lang, out_wav, rate=_base_rate_for_lang(lang), log_fn=None, gender=gender)
+            return
+        except Exception as e:
+            last = f"edge: {e}"
+            if log_fn:
+                log_fn(f"edge_failed={e}")
+    if provider in {"auto", "espeak"}:
+        try:
+            tts_espeak(text, lang, out_wav)
+            return
+        except Exception as e:
+            last = f"espeak: {e}"
+            if log_fn:
+                log_fn(f"espeak_failed={e}")
+    raise RuntimeError(f"TTS failed: {last}")
+
+
+# -----------------------------------------------------------------------------
+# Segment shaping
+# -----------------------------------------------------------------------------
+
+def merge_whisper_segments(segs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+
+    def flush():
+        nonlocal cur
+        if not cur:
+            return
+        cur["text"] = clean_text_for_translation(cur.get("text", ""))
+        if cur["text"]:
+            out.append(cur)
+        cur = None
+
+    for s in segs:
+        start = float(s.get("start") or 0.0)
+        end = float(s.get("end") or start)
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+
+        if cur is None:
+            cur = {"start": start, "end": end, "text": text}
+            continue
+
+        gap = start - float(cur["end"])
+        merged_text = (cur["text"] + " " + text).strip()
+
+        should_merge = gap <= MERGE_GAP_SECONDS and (len(cur["text"]) < MIN_SEG_CHARS or len(merged_text) <= MAX_SEG_CHARS)
+        if should_merge:
+            cur["end"] = end
+            cur["text"] = merged_text
+        else:
+            flush()
+            cur = {"start": start, "end": end, "text": text}
+
+    flush()
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Artifacts: local paths
+# -----------------------------------------------------------------------------
 
 def _job_artifact_paths(job_id: str) -> Dict[str, Path]:
     jd = job_dir(job_id)
@@ -872,43 +1437,79 @@ def _job_artifact_paths(job_id: str) -> Dict[str, Path]:
         "runner_log": jd / "runner.log",
     }
 
-# -----------------------------------------------------------------------------
-# Dubs: local paths
-# -----------------------------------------------------------------------------
 
 def dub_dir(job_id: str, lang: str) -> Path:
     return job_dir(job_id) / "dubs" / lang
 
+
 def dub_status_path(job_id: str, lang: str) -> Path:
     return dub_dir(job_id, lang) / "status.json"
+
 
 def dub_audio_path(job_id: str, lang: str) -> Path:
     return dub_dir(job_id, lang) / "audio.wav"
 
+
 def dub_video_path(job_id: str, lang: str) -> Path:
     return dub_dir(job_id, lang) / "video.mp4"
+
 
 def dub_log_path(job_id: str, lang: str) -> Path:
     return dub_dir(job_id, lang) / "log.txt"
 
+
+def dub_captions_path(job_id: str, lang: str) -> Path:
+    return dub_dir(job_id, lang) / "captions.srt"
+
+
 def dub_runner_log_path(job_id: str, lang: str) -> Path:
     return dub_dir(job_id, lang) / "runner.log"
+
 
 def write_dub_status(job_id: str, lang: str, status: str, error: Optional[str] = None) -> None:
     p = dub_status_path(job_id, lang)
     p.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         p,
-        json.dumps(
-            {"job_id": job_id, "lang": lang, "status": status, "error": error, "updated_at": now_iso()},
-            indent=2,
-        ),
+        json.dumps({"job_id": job_id, "lang": lang, "status": status, "error": error, "updated_at": now_iso()}, indent=2),
     )
     sb_upsert_dub_status(job_id, lang, status, error=error)
+
 
 # -----------------------------------------------------------------------------
 # Base job processing
 # -----------------------------------------------------------------------------
+
+def yt_dlp_supports(yt_dlp_bin: str, flag: str) -> bool:
+    rc, out = run_cmd([yt_dlp_bin, "--help"], cwd=None)
+    return rc == 0 and (flag in out)
+
+
+def materialize_cookies(tmp_job_dir: Path, log_lines: List[str]) -> Optional[Path]:
+    pth = (os.getenv("YTDLP_COOKIES_PATH") or "").strip()
+    if pth:
+        cp = Path(pth)
+        if cp.exists() and cp.stat().st_size > 10:
+            log_lines.append(f"cookies=path:{cp}")
+            return cp
+        log_lines.append("cookies_path_invalid")
+
+    b64 = (os.getenv("YTDLP_COOKIES_B64") or "").strip()
+    if not b64:
+        log_lines.append("cookies=none")
+        return None
+
+    try:
+        cookies_path = tmp_job_dir / "cookies.txt"
+        raw = base64.b64decode(b64.encode("utf-8"))
+        cookies_path.write_bytes(raw)
+        os.chmod(cookies_path, 0o600)
+        log_lines.append("cookies=materialized_b64")
+        return cookies_path
+    except Exception as e:
+        log_lines.append(f"cookies_error={e}")
+        return None
+
 
 def process_job(job_id: str, url: str) -> None:
     with JOB_SEM:
@@ -935,6 +1536,7 @@ def process_job(job_id: str, url: str) -> None:
         try:
             yt_dlp_bin = require_bin("yt-dlp")
             ffmpeg_bin = require_bin("ffmpeg")
+
             log_lines.append("== ENV ==")
             log_lines.append(f"BUILD_TAG={BUILD_TAG}")
             log_lines.append(f"yt-dlp={yt_dlp_bin}")
@@ -1080,578 +1682,54 @@ def process_job(job_id: str, url: str) -> None:
             except Exception:
                 pass
 
-# -----------------------------------------------------------------------------
-# Transcribe + translate
-# -----------------------------------------------------------------------------
-
-def whisper_transcribe(audio_path: Path) -> Dict[str, Any]:
-    whisper = _get_whisper()
-    segments, info = whisper.transcribe(str(audio_path), beam_size=2)
-    seg_list = []
-    full = []
-    for s in segments:
-        seg_list.append({"start": float(s.start), "end": float(s.end), "text": (s.text or "")})
-        txt = (s.text or "").strip()
-        if txt:
-            full.append(txt)
-    return {"language": getattr(info, "language", None), "text": " ".join(full), "segments": seg_list}
-
-def _truncate(s: str, n: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= n:
-        return s
-    head = s[:n]
-    return head.rsplit(" ", 1)[0] if " " in head else head
-
-def clean_text_for_translation(text: str) -> str:
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"\.{2,}", ".", text)
-    text = re.sub(r"([.!?])\1+", r"\1", text)
-    return text.strip()
-
-def split_into_sentences(text: str) -> List[str]:
-    sentences = re.split(r"([.!?]+\s+)", text)
-    result = []
-    for i in range(0, len(sentences) - 1, 2):
-        sent = sentences[i] + (sentences[i + 1] if i + 1 < len(sentences) else "")
-        sent = sent.strip()
-        if sent:
-            result.append(sent)
-    if not result and text.strip():
-        result = [text.strip()]
-    return result
-
-_translate_cache: Dict[str, str] = {}
-
-def translate_text(text: str, target_lang: str) -> str:
-    text = _truncate(text, MAX_TRANSCRIPT_CHARS)
-    text = clean_text_for_translation(text)
-    if not text:
-        return ""
-    if target_lang == "en":
-        return text
-
-    cache_key = f"{target_lang}::{text}"
-    if cache_key in _translate_cache:
-        return _translate_cache[cache_key]
-
-    if ENABLE_LOCAL_NLLB:
-        tok, model = _get_nllb()
-        tgt_map = {"en": "eng_Latn", "hi": "hin_Deva", "es": "spa_Latn"}
-        tgt = tgt_map.get(target_lang)
-        if not tgt:
-            _translate_cache[cache_key] = text
-            return text
-        inputs = tok(text, return_tensors="pt", truncation=True, max_length=1024)
-        forced_bos = tok.convert_tokens_to_ids(tgt)
-        out = model.generate(**inputs, forced_bos_token_id=forced_bos, max_new_tokens=512)
-        translated = tok.batch_decode(out, skip_special_tokens=True)[0].strip()
-        _translate_cache[cache_key] = translated
-        return translated
-
-    if TRANSLATE_PROVIDER == "libretranslate":
-        base = (os.getenv("LIBRETRANSLATE_URL") or "").strip().rstrip("/")
-        if not base:
-            raise RuntimeError("LIBRETRANSLATE_URL not set")
-        api_key = (os.getenv("LIBRETRANSLATE_API_KEY") or "").strip()
-        payload = {"q": text, "source": "auto", "target": target_lang, "format": "text"}
-        if api_key:
-            payload["api_key"] = api_key
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url=f"{base}/translate", data=data, headers={"Content-Type": "application/json"}, method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-        out = json.loads(body)
-        translated = (out.get("translatedText") or "").strip()
-        _translate_cache[cache_key] = translated
-        return translated
-
-    # Default: google_free
-    q = urllib.parse.quote(text)
-    url = (
-        "https://translate.googleapis.com/translate_a/single"
-        f"?client=gtx&sl=auto&tl={urllib.parse.quote(target_lang)}&dt=t&q={q}"
-    )
-    with urllib.request.urlopen(url, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", errors="ignore")
-    arr = json.loads(raw)
-    translated = "".join([chunk[0] for chunk in arr[0] if chunk and chunk[0]]).strip()
-    _translate_cache[cache_key] = translated
-    return translated
-
-# -----------------------------------------------------------------------------
-# TTS
-# -----------------------------------------------------------------------------
-
-import asyncio
-
-def _edge_voice_for(lang: str, gender: str = "unknown") -> str:
-    """
-    gender: male | female | unknown
-    Falls back to EDGE_TTS_VOICE_* if per-gender env not provided.
-    """
-    lang = (lang or "en").lower()
-    gender = (gender or "unknown").lower()
-
-    # Per-gender env keys
-    key_map = {
-        ("hi", "male"): "EDGE_TTS_VOICE_HI_MALE",
-        ("hi", "female"): "EDGE_TTS_VOICE_HI_FEMALE",
-        ("en", "male"): "EDGE_TTS_VOICE_EN_MALE",
-        ("en", "female"): "EDGE_TTS_VOICE_EN_FEMALE",
-        ("es", "male"): "EDGE_TTS_VOICE_ES_MALE",
-        ("es", "female"): "EDGE_TTS_VOICE_ES_FEMALE",
-    }
-
-    # Fallback env keys (your existing ones)
-    fallback_env = {
-        "hi": os.getenv("EDGE_TTS_VOICE_HI", "hi-IN-MadhurNeural"),
-        "en": os.getenv("EDGE_TTS_VOICE_EN", "en-IN-PrabhatNeural"),
-        "es": os.getenv("EDGE_TTS_VOICE_ES", "es-ES-ElviraNeural"),
-    }
-
-    # Default male/female if nothing set
-    defaults = {
-        ("hi", "male"): "hi-IN-MadhurNeural",
-        ("hi", "female"): "hi-IN-SwaraNeural",
-        ("en", "male"): "en-IN-PrabhatNeural",
-        ("en", "female"): "en-IN-NeerjaNeural",
-        ("es", "male"): "es-ES-AlvaroNeural",
-        ("es", "female"): "es-ES-ElviraNeural",
-    }
-
-    env_key = key_map.get((lang, gender))
-    if env_key:
-        v = (os.getenv(env_key) or "").strip()
-        if v:
-            return v
-
-    # If unknown gender, prefer your existing voice env
-    if gender == "unknown":
-        return fallback_env.get(lang, fallback_env["en"])
-
-    return defaults.get((lang, gender), fallback_env.get(lang, fallback_env["en"]))
-
-def _base_rate_for_lang(lang: str) -> str:
-    # Keep this close to natural. Timing is handled mostly by segment fitting.
-    rates = {
-        "hi": os.getenv("EDGE_TTS_RATE_HI", os.getenv("EDGE_TTS_RATE", "-5%")),
-        "en": os.getenv("EDGE_TTS_RATE_EN", os.getenv("EDGE_TTS_RATE", "+0%")),
-        "es": os.getenv("EDGE_TTS_RATE_ES", os.getenv("EDGE_TTS_RATE", "+0%")),
-    }
-    return rates.get(lang, os.getenv("EDGE_TTS_RATE", "+0%"))
-
-def _rate_candidates(base_rate: str) -> List[str]:
-    # If we must fit into a short segment, we try faster rates.
-    # edge-tts expects strings like "+10%" or "-5%"
-    # We keep it conservative to avoid "chipmunk" speech.
-    return [
-        base_rate,
-        "+10%",
-        "+20%",
-        "+30%",
-        "+40%",
-    ]
-
-def _safe_text_for_tts(text: str) -> str:
-    text = clean_text_for_translation(text)
-    # Light cleanup to prevent awkward pauses
-    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
-    text = re.sub(r"([,.;:!?])([A-Za-z])", r"\1 \2", text)
-    return text.strip()
-
-async def _edge_tts_to_mp3_async(
-    text: str, lang: str, out_mp3: Path, rate: str, volume: str, pitch: str, gender: str = "unknown"
-) -> None:
-    import edge_tts
-    out_mp3.parent.mkdir(parents=True, exist_ok=True)
-    voice = _edge_voice_for(lang, gender)
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, volume=volume, pitch=pitch)
-    await communicate.save(str(out_mp3))
-
-    if not out_mp3.exists() or out_mp3.stat().st_size < 1024:
-        raise RuntimeError("edge-tts produced empty audio")
-
-def tts_edge(text: str, lang: str, out_wav: Path, rate: str, log_fn=None, gender: str = "unknown") -> None:
-    text = _safe_text_for_tts(text)
-    if not text:
-        raise RuntimeError("TTS text empty")
-
-    tmp_mp3 = out_wav.with_suffix(".mp3")
-    asyncio.run(_edge_tts_to_mp3_async(text, lang, tmp_mp3, rate=rate, volume=EDGE_TTS_VOLUME, pitch=EDGE_TTS_PITCH, gender=gender))
-
-    ffmpeg_bin = require_bin("ffmpeg")
-    cmd = [ffmpeg_bin, "-y", "-i", str(tmp_mp3), "-ac", "1", "-ar", "16000", str(out_wav)]
-    rc, out = run_cmd(cmd, cwd=None)
-    tmp_mp3.unlink(missing_ok=True)
-    if log_fn:
-        log_fn(out)
-    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
-        tail = "\n".join(out.splitlines()[-200:])
-        raise RuntimeError(f"ffmpeg convert failed (rc={rc})\n{tail}")
-
-def _espeak_voice_for(lang: str) -> str:
-    return {"hi": "hi", "en": "en-us", "es": "es"}.get(lang, "en-us")
-
-def tts_espeak(text: str, lang: str, out_wav: Path) -> None:
-    text = _safe_text_for_tts(text)
-    voice = _espeak_voice_for(lang)
-    tmp = out_wav.with_suffix(".espeak.wav")
-    cmd = ["espeak-ng", "-v", voice, "-w", str(tmp), "--stdin"]
-    proc = subprocess.run(cmd, input=text, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if proc.returncode != 0:
-        raise RuntimeError(f"espeak-ng failed (rc={proc.returncode})\n{proc.stdout[-2000:]}")
-    ffmpeg_bin = require_bin("ffmpeg")
-    rc, out = run_cmd([ffmpeg_bin, "-y", "-i", str(tmp), "-ac", "1", "-ar", "16000", str(out_wav)], cwd=None)
-    tmp.unlink(missing_ok=True)
-    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
-        raise RuntimeError(f"ffmpeg convert failed (rc={rc})\n{out.splitlines()[-200:]}")
-
-def tts_speak(text: str, lang: str, out_wav: Path, log_fn=None, gender: str = "unknown") -> None:
-    """
-    Non-timed fallback: sentence splitting + stitch.
-    Timed dubbing uses a different path (segment-based).
-    """
-    text = (text or "").strip()
-    if not text:
-        raise RuntimeError("TTS text empty")
-
-    provider = (os.getenv("TTS_PROVIDER") or "auto").strip().lower()
-
-    if ENABLE_SENTENCE_SPLITTING and len(text) > 200:
-        sentences = split_into_sentences(text)
-        if log_fn:
-            log_fn(f"split_sentences={len(sentences)}")
-
-        temp_wavs: List[Path] = []
-        for i, sentence in enumerate(sentences):
-            if not sentence.strip():
-                continue
-            tmp_wav = out_wav.with_suffix(f".sent{i}.wav")
-
-            def try_edge():
-                tts_edge(sentence, lang, tmp_wav, rate=_base_rate_for_lang(lang), log_fn=None, gender=gender)
-
-            def try_espeak():
-                tts_espeak(sentence, lang, tmp_wav)
-
-            attempts: List[Tuple[str, Any]] = []
-            if provider == "edge":
-                attempts = [("edge", try_edge)]
-            elif provider == "espeak":
-                attempts = [("espeak", try_espeak)]
-            else:
-                attempts = [("edge", try_edge), ("espeak", try_espeak)]
-
-            success = False
-            for name, fn in attempts:
-                try:
-                    fn()
-                    temp_wavs.append(tmp_wav)
-                    success = True
-                    break
-                except Exception as e:
-                    if log_fn:
-                        log_fn(f"sentence_tts_failed idx={i} provider={name} err={e}")
-
-            if not success:
-                raise RuntimeError(f"Failed to generate TTS for sentence {i+1}")
-
-        ffmpeg_concat_wavs(temp_wavs, out_wav, log_fn=log_fn)
-
-        for w in temp_wavs:
-            w.unlink(missing_ok=True)
-        return
-
-    # Single shot
-    last = None
-    if provider in {"auto", "edge"}:
-        try:
-            tts_edge(text, lang, out_wav, rate=_base_rate_for_lang(lang), log_fn=None, gender=gender)
-            return
-        except Exception as e:
-            last = f"edge: {e}"
-            if log_fn:
-                log_fn(f"edge_failed={e}")
-    if provider in {"auto", "espeak"}:
-        try:
-            tts_espeak(text, lang, out_wav)
-            return
-        except Exception as e:
-            last = f"espeak: {e}"
-            if log_fn:
-                log_fn(f"espeak_failed={e}")
-    raise RuntimeError(f"TTS failed: {last}")
-
-# -----------------------------------------------------------------------------
-# Audio + video timing helpers
-# -----------------------------------------------------------------------------
-
-def video_duration_seconds(p: Path) -> Optional[float]:
-    try:
-        ffprobe = require_bin("ffprobe")
-        rc, out = run_cmd(
-            [
-                ffprobe,
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=nw=1:nk=1",
-                str(p),
-            ],
-            cwd=None,
-        )
-        if rc != 0:
-            return None
-        val = out.strip().splitlines()[-1].strip()
-        return float(val)
-    except Exception:
-        return None
-
-def atempo_chain(factor: float) -> str:
-    # ffmpeg atempo supports 0.5..2.0 per filter. We chain when needed.
-    if factor <= 0:
-        return "atempo=1.0"
-    parts: List[float] = []
-    f = factor
-    while f > 2.0:
-        parts.append(2.0)
-        f /= 2.0
-    while f < 0.5:
-        parts.append(0.5)
-        f /= 0.5
-    parts.append(f)
-    return ",".join([f"atempo={p:.4f}" for p in parts])
-
-def stretch_or_pad_to_duration(in_wav: Path, out_wav: Path, target_sec: float, log_fn=None) -> None:
-    """
-    Keep speech natural:
-    - If audio is shorter: do NOT slow it down. Just pad silence.
-    - If audio is longer: speed up to fit (atempo), then trim to target.
-    Always produce exactly target_sec duration.
-    """
-    ffmpeg = require_bin("ffmpeg")
-    d_in = max(0.001, wav_duration_seconds(in_wav))
-    target = max(0.05, float(target_sec))
-
-    # Speed up only if needed
-    if d_in > target:
-        tempo = d_in / target
-        tempo_f = atempo_chain(tempo)
-        af = f"{tempo_f},apad"
-    else:
-        af = "apad"
-
-    # Add tiny fades to reduce clicks
-    fade_d = min(0.03, target / 4.0)
-    # if fade is too tiny, skip
-    if fade_d > 0.005:
-        st_out = max(0.0, target - fade_d)
-        af = f"{af},afade=t=in:st=0:d={fade_d:.4f},afade=t=out:st={st_out:.4f}:d={fade_d:.4f}"
-
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(in_wav),
-        "-af",
-        af,
-        "-t",
-        f"{target:.4f}",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        str(out_wav),
-    ]
-    rc, out = run_cmd(cmd, cwd=None)
-    if log_fn:
-        log_fn(out)
-    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
-        tail = "\n".join(out.splitlines()[-200:])
-        raise RuntimeError(f"segment fit failed (rc={rc})\n{tail}")
-
-def ffmpeg_concat_wavs(inputs: List[Path], out_wav: Path, log_fn=None) -> None:
-    if not inputs:
-        raise RuntimeError("concat: no inputs")
-    if len(inputs) == 1:
-        safe_move(inputs[0], out_wav)
-        return
-
-    ffmpeg = require_bin("ffmpeg")
-    args = [ffmpeg, "-y"]
-    for p in inputs:
-        args += ["-i", str(p)]
-
-    n = len(inputs)
-    filter_parts = []
-    for i in range(n):
-        filter_parts.append(f"[{i}:a]")
-    filter_str = "".join(filter_parts) + f"concat=n={n}:v=0:a=1[a]"
-
-    args += ["-filter_complex", filter_str, "-map", "[a]", "-ac", "1", "-ar", "16000", str(out_wav)]
-    rc, out = run_cmd(args, cwd=None)
-    if log_fn:
-        log_fn(out)
-    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
-        tail = "\n".join(out.splitlines()[-200:])
-        raise RuntimeError(f"concat failed (rc={rc})\n{tail}")
-
-def normalize_audio(audio_path: Path, log_fn=None) -> None:
-    if not ENABLE_AUDIO_NORMALIZATION:
-        return
-    try:
-        ffmpeg_bin = require_bin("ffmpeg")
-        normalized = audio_path.with_suffix(".normalized.wav")
-        rc, out = run_cmd(
-            [
-                ffmpeg_bin,
-                "-y",
-                "-i",
-                str(audio_path),
-                "-af",
-                "loudnorm=I=-16:TP=-1.5:LRA=11",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                str(normalized),
-            ],
-            cwd=None,
-        )
-        if rc == 0 and normalized.exists() and normalized.stat().st_size > 2048:
-            normalized.replace(audio_path)
-            if log_fn:
-                log_fn("audio_normalized=true")
-        else:
-            if log_fn:
-                log_fn("audio_normalized=false (non-critical)")
-    except Exception as e:
-        if log_fn:
-            log_fn(f"audio_normalized_error={e} (non-critical)")
-
-def mux_audio_into_video(video_in: Path, audio_in: Path, video_out: Path, log_fn=None) -> None:
-    ffmpeg = require_bin("ffmpeg")
-    video_out.parent.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(video_in),
-        "-i",
-        str(audio_in),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "160k",
-        "-shortest",
-        str(video_out),
-    ]
-    rc, out = run_cmd(cmd, cwd=None)
-    if log_fn:
-        log_fn("== ffmpeg mux ==")
-        log_fn(out)
-    if rc != 0:
-        tail = "\n".join(out.splitlines()[-200:])
-        raise RuntimeError(f"ffmpeg mux failed (rc={rc})\n{tail}")
-
-# -----------------------------------------------------------------------------
-# Segment shaping
-# -----------------------------------------------------------------------------
-
-def merge_whisper_segments(segs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    cur: Optional[Dict[str, Any]] = None
-
-    def flush():
-        nonlocal cur
-        if not cur:
-            return
-        cur["text"] = clean_text_for_translation(cur.get("text", ""))
-        if cur["text"]:
-            out.append(cur)
-        cur = None
-
-    for s in segs:
-        start = float(s.get("start") or 0.0)
-        end = float(s.get("end") or start)
-        text = (s.get("text") or "").strip()
-
-        if not text:
-            continue
-
-        if cur is None:
-            cur = {"start": start, "end": end, "text": text}
-            continue
-
-        gap = start - float(cur["end"])
-        merged_text = (cur["text"] + " " + text).strip()
-
-        should_merge = (
-            gap <= MERGE_GAP_SECONDS
-            and (len(cur["text"]) < MIN_SEG_CHARS or len(merged_text) <= MAX_SEG_CHARS)
-        )
-
-        if should_merge:
-            cur["end"] = end
-            cur["text"] = merged_text
-        else:
-            flush()
-            cur = {"start": start, "end": end, "text": text}
-
-    flush()
-    return out
-
-def pad_or_trim_to_video_length(dub_wav: Path, video_in: Path, out_wav: Path, log_fn=None) -> None:
-    """
-    Ensure final dub audio matches video duration.
-    If we cannot get duration, do nothing.
-    """
-    vd = video_duration_seconds(video_in)
-    if vd is None or vd <= 0:
-        if log_fn:
-            log_fn("video_duration_unknown=true; skipping final pad/trim")
-        dub_wav.replace(out_wav)
-        return
-
-    ffmpeg = require_bin("ffmpeg")
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(dub_wav),
-        "-af",
-        "apad",
-        "-t",
-        f"{vd:.4f}",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        str(out_wav),
-    ]
-    rc, out = run_cmd(cmd, cwd=None)
-    if log_fn:
-        log_fn(f"final_audio_target_sec={vd:.4f}")
-        log_fn(out)
-    if rc != 0 or (not out_wav.exists()) or out_wav.stat().st_size < 2048:
-        tail = "\n".join(out.splitlines()[-200:])
-        raise RuntimeError(f"final pad/trim failed (rc={rc})\n{tail}")
 
 # -----------------------------------------------------------------------------
 # Artifact retrieval
 # -----------------------------------------------------------------------------
+
+def ensure_local_from_storage(job_id: str, job: Dict[str, Any], filename: str, local_path: Path, key_field: str) -> bool:
+    try:
+        if local_path.exists() and local_path.stat().st_size > 0:
+            return True
+    except Exception:
+        pass
+    key = job.get(key_field)
+    if key and sb_download_key(key, local_path):
+        return True
+    return sb_download_file(job_id, filename, local_path)
+
+
+def dub_storage_keys_from_status(dub_status: Dict[str, Any], lang: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    info = _as_dict(dub_status.get(lang))
+    return (info.get("audio_key"), info.get("video_key"), info.get("log_key"), info.get("srt_key"))
+
+
+def ensure_local_dub_from_storage(job_id: str, lang: str, dub_status: Dict[str, Any], kind: str, local_path: Path) -> bool:
+    try:
+        if local_path.exists() and local_path.stat().st_size > 0:
+            return True
+    except Exception:
+        pass
+
+    audio_key, video_key, log_key, srt_key = dub_storage_keys_from_status(dub_status, lang)
+
+    if kind == "audio":
+        key = audio_key
+        fallback_filename = f"dubs/{lang}/audio.wav"
+    elif kind == "video":
+        key = video_key
+        fallback_filename = f"dubs/{lang}/video.mp4"
+    elif kind == "captions":
+        key = srt_key
+        fallback_filename = f"dubs/{lang}/captions.srt"
+    else:
+        key = log_key
+        fallback_filename = f"dubs/{lang}/log.txt"
+
+    if key and sb_download_key(key, local_path):
+        return True
+    return sb_download_file(job_id, fallback_filename, local_path)
+
 
 def load_job_for_artifacts(job_id: str) -> Dict[str, Any]:
     local = load_job_local(job_id)
@@ -1683,6 +1761,7 @@ def load_job_for_artifacts(job_id: str) -> Dict[str, Any]:
         return local
     return load_job(job_id)
 
+
 def ensure_base_artifacts_local(job_id: str, job: Dict[str, Any]) -> Tuple[Path, Path]:
     paths = _job_artifact_paths(job_id)
     paths["job_dir"].mkdir(parents=True, exist_ok=True)
@@ -1699,7 +1778,7 @@ def ensure_base_artifacts_local(job_id: str, job: Dict[str, Any]) -> Tuple[Path,
         if not sb_download_key(key, audio_p):
             raise RuntimeError("base audio missing locally and not found in storage")
 
-    patch = {}
+    patch: Dict[str, Any] = {}
     if not job.get("video_path"):
         patch["video_path"] = str(video_p.resolve())
     if not job.get("audio_path"):
@@ -1710,6 +1789,7 @@ def ensure_base_artifacts_local(job_id: str, job: Dict[str, Any]) -> Tuple[Path,
         update_job(job_id, patch)
 
     return video_p, audio_p
+
 
 # -----------------------------------------------------------------------------
 # Dubbing
@@ -1724,9 +1804,9 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
     with DUB_SEM:
         dd = dub_dir(job_id, lang)
         dd.mkdir(parents=True, exist_ok=True)
-        local_log_path = dub_log_path(job_id, lang)    
 
-        srt_path = dd / "captions.srt"
+        local_log_path = dub_log_path(job_id, lang)
+        srt_path = dub_captions_path(job_id, lang)
 
         def log(line: str) -> None:
             line = line.rstrip()
@@ -1741,12 +1821,12 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
             caption_style = (caption_style or "clean").strip().lower()
             if caption_style not in CAPTION_STYLE_FORCE:
                 caption_style = "clean"
+
             write_dub_status(job_id, lang, "running")
             log("== DUB START (TIMED) ==")
             log(f"timed_dub={ENABLE_TIMED_DUB}")
             log(f"audio_norm={ENABLE_AUDIO_NORMALIZATION}")
             log(f"whisper_model={WHISPER_MODEL} translate={TRANSLATE_PROVIDER}")
-
             heartbeat()
 
             job = load_job_for_artifacts(job_id)
@@ -1754,13 +1834,14 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
                 raise RuntimeError(f"base job not done (status={job.get('status')})")
 
             video_in, audio_in = ensure_base_artifacts_local(job_id, job)
+
             out_audio = dub_audio_path(job_id, lang)
             out_video = dub_video_path(job_id, lang)
 
+            # Gender selection
             mode = (os.getenv("VOICE_GENDER_MODE") or "auto").strip().lower()
             speaker_gender = "unknown"
             speaker_f0 = None
-
             if mode in {"male", "female"}:
                 speaker_gender = mode
             else:
@@ -1768,7 +1849,9 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
                 speaker_gender = infer_gender_from_f0(speaker_f0)
 
             log(f"speaker_f0_hz={speaker_f0} speaker_gender={speaker_gender}")
+            heartbeat()
 
+            # Cache hit
             if (
                 out_audio.exists()
                 and out_video.exists()
@@ -1778,9 +1861,6 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
             ):
                 log("cached=true (local dub exists)")
             else:
-                ffmpeg = require_bin("ffmpeg")
-                _ = ffmpeg  # keeps lint calm
-
                 log("transcribing...")
                 tr = whisper_transcribe(audio_in)
                 src_text = tr.get("text", "") or ""
@@ -1792,110 +1872,36 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
                     raise RuntimeError("transcription empty")
 
                 merged = merge_whisper_segments(segs) if (ENABLE_TIMED_DUB and segs) else []
+                merged = merged[:MAX_DUB_SEGMENTS]
                 log(f"segments_merged={len(merged)}")
+                heartbeat()
+
                 # Timed path
-                if ENABLE_TIMED_DUB and merged and len(merged) <= MAX_DUB_SEGMENTS:
-
-                    # Build timed audio using segment timeline + gap silence (best lip sync)
-                    
-                    if not merged:
-                        raise RuntimeError("no usable segments after merge")
-
-                    import textwrap
-
-                    def _ass_escape(s: str) -> str:
-                        # ASS reserved chars
-                        s = s.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
-                        # ASS line breaks
-                        s = s.replace("\n", " ").strip()
-                        return s
-
-                    def build_ass(subs, out_ass_path: str, style_id: str, play_res=(1080, 1920)):
-                        """
-                        subs: list of dicts like:
-                        { "start": 1.23, "end": 2.80, "text": "..." }
-                        """
-                        W, H = play_res
-
-                        # Safe margins so nothing touches edges
-                        margin_lr = 80
-                        margin_v = 90
-
-                        # Style mapping for your captionStyle values
-                        if style_id == "big":
-                            font_size = 70
-                            outline = 5
-                            box = False
-                        elif style_id == "boxed":
-                            font_size = 56
-                            outline = 3
-                            box = True
-                        elif style_id == "bold":
-                            font_size = 56
-                            outline = 4
-                            box = False
-                        else:  # clean
-                            font_size = 52
-                            outline = 3
-                            box = False
-
-                        # Wrapping: tune this if needed
-                        # Larger font -> fewer chars per line
-                        wrap_width = 28 if font_size >= 65 else 34
-
-                        header = f"""[Script Info]
-                    ScriptType: v4.00+
-                    PlayResX: {W}
-                    PlayResY: {H}
-                    WrapStyle: 2
-                    ScaledBorderAndShadow: yes
-
-                    [V4+ Styles]
-                    Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-                    Style: Default,Arial,{font_size},&H00FFFFFF,&H000000FF,&H00101010,&H7F000000,0,0,0,0,100,100,0,0,{3 if box else 1},{outline},0,2,{margin_lr},{margin_lr},{margin_v},1
-
-                    [Events]
-                    Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-                    """
-
-                        def fmt_time(t: float) -> str:
-                            # h:mm:ss.cs
-                            if t < 0: t = 0
-                            h = int(t // 3600)
-                            m = int((t % 3600) // 60)
-                            s = t % 60
-                            cs = int(round((s - int(s)) * 100))
-                            return f"{h}:{m:02d}:{int(s):02d}.{cs:02d}"
-
-                        lines = [header]
-                        for seg in subs:
-                            start = fmt_time(float(seg["start"]))
-                            end = fmt_time(float(seg["end"]))
-                            raw = str(seg.get("text", "")).strip()
-                            if not raw:
-                                continue
-
-                            wrapped = textwrap.fill(raw, width=wrap_width)
-                            text = _ass_escape(wrapped).replace("\n", r"\N")
-
-                            lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n")
-
-                        with open(out_ass_path, "w", encoding="utf-8") as f:
-                            f.writelines(lines)
-
-                    # Optional: cap segments for speed
-                    max_segments = int(os.getenv("MAX_DUB_SEGMENTS", "140"))
-                    merged = merged[:max_segments]
+                if ENABLE_TIMED_DUB and merged:
+                    seg_tmp_dir = dd / "segs"
+                    if seg_tmp_dir.exists():
+                        shutil.rmtree(seg_tmp_dir, ignore_errors=True)
+                    seg_tmp_dir.mkdir(parents=True, exist_ok=True)
 
                     timeline_parts: List[Path] = []
                     prev_end = 0.0
-
-                    seg_tmp_dir = dd / "segs"
-                    seg_tmp_dir.mkdir(parents=True, exist_ok=True)
+                    subs: List[Dict[str, Any]] = []
 
                     log(f"building_timed_audio segments={len(merged)}")
 
-                    subs: List[Dict[str, Any]] = []
+                    def tts_edge_best_fit(text: str, out_wav: Path, target_sec: float, gender: str) -> Tuple[str, float]:
+                        base = _base_rate_for_lang(lang)
+                        last_rate = _rate_candidates(base)[-1]
+                        last_d = 0.0
+                        for rate in _rate_candidates(base):
+                            tts_edge(text, lang, out_wav, rate=rate, log_fn=None, gender=gender)
+                            d = wav_duration_seconds(out_wav)
+                            last_rate, last_d = rate, d
+                            if d <= target_sec * SEGMENT_FIT_TOLERANCE:
+                                return rate, d
+                        return last_rate, last_d
+
+                    provider = (os.getenv("TTS_PROVIDER") or "auto").strip().lower()
 
                     for idx, s in enumerate(merged):
                         start = float(s.get("start", 0.0))
@@ -1908,52 +1914,44 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
 
                         heartbeat()
 
-                        # Insert gap silence so we respect original timing
+                        # Insert silence gap to preserve original timing (lip-sync improvement)
                         gap = start - prev_end
                         if gap > 0.02:
                             sil = seg_tmp_dir / f"seg_{idx:04d}_gap.wav"
                             make_silence_wav(gap, sil)
                             timeline_parts.append(sil)
 
-                        # Translate per segment (keeps boundaries aligned)
                         seg_tr = seg_text if lang == "en" else translate_text(seg_text, lang)
-                        seg_tr = (seg_tr or "").strip()
+                        seg_tr = _truncate((seg_tr or "").strip(), 260)
                         if not seg_tr:
-                            seg_tr = seg_text  # fallback to avoid accidental silence
+                            seg_tr = seg_text
+
                         subs.append({"start": start, "end": end, "text": seg_tr})
+
                         seg_raw = seg_tmp_dir / f"seg_{idx:04d}_raw.wav"
                         seg_fit = seg_tmp_dir / f"seg_{idx:04d}_fit.wav"
 
-                        # TTS per segment with gender-aware voice
                         voice = _edge_voice_for(lang, speaker_gender)
-                        log(f"seg={idx} dur={dur:.2f}s gender={speaker_gender} voice={voice} text={seg_tr[:60]}")
+                        log(f"seg={idx} dur={dur:.2f}s gender={speaker_gender} voice={voice} text={seg_tr[:80]}")
+                        heartbeat()
 
-                        # Generate raw segment audio
-                        def tts_edge_best_fit(text: str, lang: str, out_wav: Path, target_sec: float, gender: str) -> Tuple[str, float]:
-                            """
-                            Prefer Edge-native speaking rate changes over ffmpeg atempo.
-                            Returns (rate_used, duration_sec).
-                            """
-                            base = _base_rate_for_lang(lang)
-                            for rate in _rate_candidates(base):
-                                tts_edge(text, lang, out_wav, rate=rate, log_fn=None, gender=gender)
-                                d = wav_duration_seconds(out_wav)
-                                if d <= target_sec * SEGMENT_FIT_TOLERANCE:
-                                    return rate, d
-                            # still too long - keep last and let stretch_or_pad_to_duration atempo it
-                            d = wav_duration_seconds(out_wav)
-                            return _rate_candidates(base)[-1], d
-
-                        provider = (os.getenv("TTS_PROVIDER") or "auto").strip().lower()
+                        # Generate raw segment audio with robust fallback
+                        raw_d = 0.0
                         if provider in {"auto", "edge"}:
-                            rate_used, raw_d = tts_edge_best_fit(seg_tr, lang, seg_raw, dur, speaker_gender)
-                            log(f"seg={idx} edge_rate={rate_used} raw_dur={raw_d:.2f}s target={dur:.2f}s")
+                            try:
+                                rate_used, raw_d = tts_edge_best_fit(seg_tr, seg_raw, dur, speaker_gender)
+                                log(f"seg={idx} edge_rate={rate_used} raw_dur={raw_d:.2f}s target={dur:.2f}s")
+                            except Exception as e:
+                                log(f"seg={idx} edge_failed err={e} (fallback espeak)")
+                                tts_espeak(seg_tr, lang, seg_raw)
+                                raw_d = wav_duration_seconds(seg_raw)
+                                log(f"seg={idx} espeak raw_dur={raw_d:.2f}s target={dur:.2f}s")
                         else:
                             tts_espeak(seg_tr, lang, seg_raw)
                             raw_d = wav_duration_seconds(seg_raw)
                             log(f"seg={idx} espeak raw_dur={raw_d:.2f}s target={dur:.2f}s")
 
-                        # Fit to exact segment window without slowing down (pad if short, speed up only if long)
+                        # Fit to exact segment window without slowing down
                         stretch_or_pad_to_duration(seg_raw, seg_fit, dur, log_fn=None)
                         timeline_parts.append(seg_fit)
 
@@ -1982,7 +1980,6 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
                     if subs:
                         log(f"burning_captions style={caption_style} ...")
                         burn_captions(tmp_video, srt_path, out_video, caption_style, lang=lang, log_fn=log)
-
                     else:
                         tmp_video.replace(out_video)
 
@@ -1991,11 +1988,12 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
 
                     log("dub_files=generated (timed)")
                 else:
-                    # Fallback: full text TTS
+                    # Fallback: full text
                     log("timed_dub_unavailable=true (fallback to full-text TTS)")
                     translated = src_text if lang == "en" else translate_text(src_text, lang)
+
                     vd = video_duration_seconds(video_in) or 0.0
-                    end_ts = vd if vd > 0 else float(merged[-1]["end"]) if merged else 5.0
+                    end_ts = vd if vd > 0 else 5.0
                     write_srt([{"start": 0.0, "end": end_ts, "text": translated}], srt_path)
 
                     if not translated.strip():
@@ -2023,12 +2021,11 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
             audio_key = sb_upload_file(job_id, out_audio, f"dubs/{lang}/audio.wav", "audio/wav")
             video_key = sb_upload_file(job_id, out_video, f"dubs/{lang}/video.mp4", "video/mp4")
             log_key = sb_upload_file(job_id, local_log_path, f"dubs/{lang}/log.txt", "text/plain")
-
             srt_key = sb_upload_file(job_id, srt_path, f"dubs/{lang}/captions.srt", "text/plain")
 
             log("uploaded_to_storage=true")
 
-            sb_upsert_dub_status(job_id, lang, "done", error=None, audio_key=audio_key, video_key=video_key, log_key=log_key)
+            sb_upsert_dub_status(job_id, lang, "done", error=None, audio_key=audio_key, video_key=video_key, log_key=log_key, srt_key=srt_key)
             write_dub_status(job_id, lang, "done")
             log("== DUB DONE ==")
 
@@ -2043,6 +2040,7 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
             write_dub_status(job_id, lang, "error", str(e))
             print(error_msg)
 
+
 # -----------------------------------------------------------------------------
 # API Schemas & Routes
 # -----------------------------------------------------------------------------
@@ -2050,21 +2048,26 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
 class CreateJobBody(BaseModel):
     url: HttpUrl
 
+
 class DubBody(BaseModel):
     lang: str
     caption_style: str = Field(default="clean", alias="captionStyle")
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+
 @app.get("/", response_class=PlainTextResponse)
 def root():
-    return "ClipLingua Worker OK (Timed Dub v0.9.0)"
+    return "ClipLingua Worker OK (Timed Dub v0.9.1)"
+
 
 @app.head("/")
 def head_root():
     return Response(status_code=200)
+
 
 @app.get("/debug/binaries")
 def debug_binaries():
@@ -2098,6 +2101,7 @@ def debug_binaries():
         "EDGE_TTS_PITCH": EDGE_TTS_PITCH,
     }
 
+
 @app.post("/jobs")
 def create_job(body: CreateJobBody):
     job_id = str(uuid.uuid4())
@@ -2126,9 +2130,11 @@ def create_job(body: CreateJobBody):
     threading.Thread(target=process_job, args=(job_id, str(body.url)), daemon=True).start()
     return {"jobId": job_id}
 
+
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
     return load_job(job_id)
+
 
 @app.get("/jobs/{job_id}/log", response_class=PlainTextResponse)
 def get_job_log(job_id: str):
@@ -2148,6 +2154,7 @@ def get_job_log(job_id: str):
         return rlp.read_text(encoding="utf-8", errors="ignore")
     raise HTTPException(status_code=404, detail="log not ready")
 
+
 @app.get("/jobs/{job_id}/audio")
 def get_job_audio(job_id: str):
     job = load_job(job_id)
@@ -2161,6 +2168,7 @@ def get_job_audio(job_id: str):
         update_job(job_id, {"audio_path": str(local_p.resolve()), "updated_at": now_iso(), "updated_at_ts": time.time()})
     return FileResponse(path=str(local_p), media_type="audio/wav", filename=f"{job_id}.wav")
 
+
 @app.get("/jobs/{job_id}/video")
 def get_job_video(job_id: str):
     job = load_job(job_id)
@@ -2173,6 +2181,7 @@ def get_job_video(job_id: str):
     if not job.get("video_path"):
         update_job(job_id, {"video_path": str(local_p.resolve()), "updated_at": now_iso(), "updated_at_ts": time.time()})
     return FileResponse(path=str(local_p), media_type="video/mp4", filename=f"{job_id}.mp4")
+
 
 @app.post("/jobs/{job_id}/dub")
 def dub_job(job_id: str, body: DubBody):
@@ -2194,7 +2203,9 @@ def dub_job(job_id: str, body: DubBody):
         "audio_url": f"/jobs/{job_id}/dubs/{lang}/audio",
         "video_url": f"/jobs/{job_id}/dubs/{lang}/video",
         "log_url": f"/jobs/{job_id}/dubs/{lang}/log",
+        "captions_url": f"/jobs/{job_id}/dubs/{lang}/captions",
     }
+
 
 def _parse_iso(ts: str) -> Optional[datetime]:
     try:
@@ -2202,11 +2213,13 @@ def _parse_iso(ts: str) -> Optional[datetime]:
     except Exception:
         return None
 
+
 @app.get("/jobs/{job_id}/dubs/{lang}/status")
 def get_dub_status(job_id: str, lang: str):
     lang = (lang or "").strip().lower()
     if lang not in SUPPORTED_DUB_LANGS:
         raise HTTPException(status_code=400, detail="unsupported lang")
+
     if _supabase:
         ds = sb_get_dub_status_map(job_id)
         if lang in ds:
@@ -2224,32 +2237,51 @@ def get_dub_status(job_id: str, lang: str):
                             "error": "stale: worker crashed or restarted",
                             "updated_at": now_iso(),
                         }
-
             return {"job_id": job_id, "lang": lang, **st}
+
     p = dub_status_path(job_id, lang)
     if p.exists():
         return json.loads(p.read_text(encoding="utf-8"))
     return {"job_id": job_id, "lang": lang, "status": "not_started"}
+
 
 @app.get("/jobs/{job_id}/dubs/{lang}/log", response_class=PlainTextResponse)
 def get_dub_log(job_id: str, lang: str):
     lang = (lang or "").strip().lower()
     if lang not in SUPPORTED_DUB_LANGS:
         raise HTTPException(status_code=400, detail="unsupported lang")
+
     sb_txt = sb_get_dub_log_text(job_id, lang)
     if sb_txt:
         return sb_txt
+
     lp = dub_log_path(job_id, lang)
     if lp.exists():
         return lp.read_text(encoding="utf-8", errors="ignore")
+
     dub_status = sb_get_dub_status_map(job_id)
     ok = ensure_local_dub_from_storage(job_id, lang, dub_status, "log", lp)
     if ok and lp.exists():
         return lp.read_text(encoding="utf-8", errors="ignore")
+
     rp = dub_runner_log_path(job_id, lang)
     if rp.exists():
         return rp.read_text(encoding="utf-8", errors="ignore")
     raise HTTPException(status_code=404, detail="log not ready")
+
+
+@app.get("/jobs/{job_id}/dubs/{lang}/captions")
+def get_dub_captions(job_id: str, lang: str):
+    lang = (lang or "").strip().lower()
+    if lang not in SUPPORTED_DUB_LANGS:
+        raise HTTPException(status_code=400, detail="unsupported lang")
+    p = dub_captions_path(job_id, lang)
+    if not p.exists() or p.stat().st_size < 50:
+        dub_status = sb_get_dub_status_map(job_id)
+        if not ensure_local_dub_from_storage(job_id, lang, dub_status, "captions", p):
+            raise HTTPException(status_code=404, detail="dub captions not ready")
+    return FileResponse(path=str(p), media_type="text/plain", filename=f"{job_id}_{lang}.srt")
+
 
 @app.get("/jobs/{job_id}/dubs/{lang}/audio")
 def get_dub_audio(job_id: str, lang: str):
@@ -2262,6 +2294,7 @@ def get_dub_audio(job_id: str, lang: str):
         if not ensure_local_dub_from_storage(job_id, lang, dub_status, "audio", p):
             raise HTTPException(status_code=404, detail="dub audio not ready")
     return FileResponse(path=str(p), media_type="audio/wav", filename=f"{job_id}_{lang}.wav")
+
 
 @app.get("/jobs/{job_id}/dubs/{lang}/video")
 def get_dub_video(job_id: str, lang: str):
