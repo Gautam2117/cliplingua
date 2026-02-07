@@ -100,6 +100,7 @@ app = FastAPI(title="ClipLingua Worker", version="0.9.0-timed-dub")
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+CAPTION_STYLE_FORCE = {"clean", "bold", "boxed", "big"}
 
 def srt_ts(sec: float) -> str:
     sec = max(0.0, float(sec))
@@ -1722,11 +1723,7 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
     with DUB_SEM:
         dd = dub_dir(job_id, lang)
         dd.mkdir(parents=True, exist_ok=True)
-        local_log_path = dub_log_path(job_id, lang)
-
-        caption_style = (caption_style or "clean").strip().lower()
-        if caption_style not in CAPTION_STYLE_FORCE:
-            caption_style = "clean"
+        local_log_path = dub_log_path(job_id, lang)    
 
         srt_path = dd / "captions.srt"
 
@@ -1740,6 +1737,9 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
             sb_upsert_dub_status(job_id, lang, "running", error=None)
 
         try:
+            caption_style = (caption_style or "clean").strip().lower()
+            if caption_style not in CAPTION_STYLE_FORCE:
+                caption_style = "clean"
             write_dub_status(job_id, lang, "running")
             log("== DUB START (TIMED) ==")
             log(f"timed_dub={ENABLE_TIMED_DUB}")
@@ -2128,19 +2128,20 @@ def get_dub_status(job_id: str, lang: str):
         ds = sb_get_dub_status_map(job_id)
         if lang in ds:
             st = _as_dict(ds[lang])
-            if st.get("status") == "running":
+            if st.get("status") in {"running", "queued"}:
                 t = _parse_iso(st.get("updated_at") or "")
                 if t:
                     age = (datetime.now(timezone.utc) - t).total_seconds()
                     if age > DUB_STALE_SECONDS:
-                        sb_upsert_dub_status(job_id, lang, "error", error="stale running: worker restarted or OOM")
+                        sb_upsert_dub_status(job_id, lang, "error", error="stale: worker crashed or restarted")
                         return {
                             "job_id": job_id,
                             "lang": lang,
                             "status": "error",
-                            "error": "stale running: worker restarted or OOM",
+                            "error": "stale: worker crashed or restarted",
                             "updated_at": now_iso(),
                         }
+
             return {"job_id": job_id, "lang": lang, **st}
     p = dub_status_path(job_id, lang)
     if p.exists():
