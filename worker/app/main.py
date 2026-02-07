@@ -45,6 +45,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, FileResponse, Response
 from pydantic import BaseModel, HttpUrl, Field
 from dotenv import load_dotenv
+from fastapi import Header
+
+# Optional: throttle uploads (avoid multiple heavy uploads at once)
+UPLOAD_SEM = threading.Semaphore(int(os.getenv("MAX_PARALLEL_UPLOADS", "1")))
+
+YT_PRIVACY_DEFAULT = (os.getenv("YT_PRIVACY_DEFAULT") or "unlisted").strip().lower()
+
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None
 
 load_dotenv()
 
@@ -103,6 +114,186 @@ app = FastAPI(title="ClipLingua Worker", version="0.9.1-timed-dub")
 
 CAPTION_STYLE_FORCE = {"clean", "bold", "boxed", "big"}
 
+def _get_bearer_token(authorization: str) -> Optional[str]:
+    h = (authorization or "").strip()
+    m = re.match(r"^Bearer\s+(.+)$", h, flags=re.I)
+    return m.group(1).strip() if m else None
+
+
+def supabase_uid_from_jwt(jwt_token: str) -> str:
+    """
+    Verify Supabase access token and return user id.
+    Uses Supabase Auth endpoint: GET /auth/v1/user
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase not configured on worker")
+
+    url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/user"
+    req = urllib.request.Request(
+        url=url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {jwt_token}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,  # service role works as apikey header
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(body)
+        uid = str(data.get("id") or "").strip()
+        if not uid:
+            raise HTTPException(status_code=401, detail="Invalid session")
+        return uid
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def sb_get_youtube_refresh_token(user_id: str) -> Optional[str]:
+    if not _supabase:
+        return None
+    try:
+        res = (
+            _supabase.table("user_oauth_tokens")
+            .select("refresh_token")
+            .eq("user_id", user_id)
+            .eq("provider", "youtube")
+            .limit(1)
+            .execute()
+        )
+        data = getattr(res, "data", None) or []
+        if data and isinstance(data, list):
+            rt = (data[0].get("refresh_token") or "").strip()
+            return rt or None
+        return None
+    except Exception:
+        return None
+
+
+def refresh_google_access_token(refresh_token: str) -> str:
+    """
+    Exchange refresh_token -> access_token using Google OAuth token endpoint.
+    """
+    client_id = (os.getenv("GOOGLE_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("GOOGLE_CLIENT_SECRET") or "").strip()
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=500, detail="Missing GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET on worker")
+
+    token_url = "https://oauth2.googleapis.com/token"
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url=token_url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        out = json.loads(body)
+        token = (out.get("access_token") or "").strip()
+        if not token:
+            raise RuntimeError(f"No access_token in response: {out}")
+        return token
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Failed to refresh YouTube token. Reconnect YouTube. ({e})")
+
+
+def sb_set_dub_youtube(job_id: str, lang: str, youtube_id: str, youtube_url: str) -> None:
+    """
+    Store youtube_id/url inside clip_jobs.dub_status[lang]
+    """
+    if not _supabase:
+        return
+    try:
+        current = sb_get_dub_status_map(job_id)
+        prev = _as_dict(current.get(lang))
+        prev.update({"youtube_id": youtube_id, "youtube_url": youtube_url, "updated_at": now_iso()})
+        current[lang] = prev
+        _supabase.table("clip_jobs").update({"dub_status": current, "updated_at": now_iso()}).eq("id", job_id).execute()
+    except Exception:
+        pass
+
+
+def youtube_resumable_upload_mp4(
+    mp4_path: Path,
+    access_token: str,
+    title: str,
+    description: str,
+    privacy_status: str,
+) -> Tuple[str, str]:
+    """
+    Upload mp4 to YouTube using resumable upload.
+    Returns (video_id, youtube_url)
+    """
+    if requests is None:
+        raise HTTPException(status_code=500, detail="Missing dependency: requests (install it in worker)")
+
+    privacy_status = (privacy_status or "unlisted").strip().lower()
+    if privacy_status not in {"private", "unlisted", "public"}:
+        privacy_status = "unlisted"
+
+    size = mp4_path.stat().st_size
+    if size < 10_000:
+        raise HTTPException(status_code=400, detail="MP4 is too small or missing")
+
+    init_url = "https://www.googleapis.com/upload/youtube/v3/videos"
+    params = {"uploadType": "resumable", "part": "snippet,status"}
+
+    meta = {
+        "snippet": {
+            "title": title[:95],  # keep it reasonable
+            "description": description[:4900],
+        },
+        "status": {"privacyStatus": privacy_status},
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": "video/mp4",
+        "X-Upload-Content-Length": str(size),
+    }
+
+    # 1) Start resumable session
+    r1 = requests.post(init_url, params=params, headers=headers, json=meta, timeout=(30, 60))
+    if not r1.ok:
+        raise HTTPException(status_code=400, detail=f"YouTube init failed: {r1.status_code} {r1.text[:2000]}")
+    upload_url = r1.headers.get("Location") or r1.headers.get("location")
+    if not upload_url:
+        raise HTTPException(status_code=400, detail="YouTube init did not return upload URL")
+
+    # 2) Upload bytes
+    put_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "video/mp4",
+        "Content-Length": str(size),
+    }
+
+    with open(mp4_path, "rb") as f:
+        r2 = requests.put(upload_url, headers=put_headers, data=f, timeout=(60, 60 * 60))
+
+    if not r2.ok:
+        raise HTTPException(status_code=400, detail=f"YouTube upload failed: {r2.status_code} {r2.text[:2000]}")
+
+    out = r2.json() if r2.headers.get("content-type", "").startswith("application/json") else {}
+    vid = (out.get("id") or "").strip()
+    if not vid:
+        # sometimes still json but different shape
+        raise HTTPException(status_code=400, detail=f"YouTube upload returned no video id: {str(out)[:2000]}")
+
+    url = f"https://youtu.be/{vid}"
+    return vid, url
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -2053,6 +2244,69 @@ class DubBody(BaseModel):
     lang: str
     caption_style: str = Field(default="clean", alias="captionStyle")
 
+class YouTubeUploadBody(BaseModel):
+    jobId: str = Field(..., alias="jobId")
+    lang: str
+    title: Optional[str] = None
+    description: Optional[str] = None
+    privacyStatus: Optional[str] = Field(default=None, alias="privacyStatus")
+
+
+@app.post("/api/youtube/upload")
+def youtube_upload(body: YouTubeUploadBody, authorization: str = Header(default="")):
+    if not _supabase:
+        raise HTTPException(status_code=500, detail="Supabase not enabled on worker")
+
+    token = _get_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+
+    uid = supabase_uid_from_jwt(token)
+
+    job_id = (body.jobId or "").strip()
+    lang = (body.lang or "").strip().lower()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Missing jobId")
+    if lang not in SUPPORTED_DUB_LANGS:
+        raise HTTPException(status_code=400, detail="Unsupported lang (hi/en/es)")
+
+    with UPLOAD_SEM:
+        # Ensure dub video exists locally (download from storage if needed)
+        job = load_job_for_artifacts(job_id)
+        dub_status = sb_get_dub_status_map(job_id)
+
+        mp4_path = dub_video_path(job_id, lang)
+        ok = ensure_local_dub_from_storage(job_id, lang, dub_status, "video", mp4_path)
+        if (not ok) or (not mp4_path.exists()) or mp4_path.stat().st_size < 10_000:
+            raise HTTPException(status_code=404, detail="Dub video not found. Generate dub first.")
+
+        refresh_token = sb_get_youtube_refresh_token(uid)
+        if not refresh_token:
+            raise HTTPException(status_code=400, detail="YouTube not connected for this user. Connect YouTube first.")
+
+        access_token = refresh_google_access_token(refresh_token)
+
+        # Metadata defaults
+        default_title = f"ClipLingua Dub ({lang.upper()})"
+        src_url = (job.get("url") or "").strip()
+        default_desc = f"Dub generated by ClipLingua.\nLang: {lang}\nJob: {job_id}\nSource: {src_url}".strip()
+
+        title = (body.title or default_title).strip()
+        description = (body.description or default_desc).strip()
+        privacy = (body.privacyStatus or YT_PRIVACY_DEFAULT).strip().lower()
+
+        video_id, youtube_url = youtube_resumable_upload_mp4(
+            mp4_path=mp4_path,
+            access_token=access_token,
+            title=title,
+            description=description,
+            privacy_status=privacy,
+        )
+
+        # Save into dub_status (nice for UI later)
+        sb_set_dub_youtube(job_id, lang, video_id, youtube_url)
+
+        return {"ok": True, "videoId": video_id, "url": youtube_url, "privacyStatus": privacy}
 
 @app.get("/health")
 def health():

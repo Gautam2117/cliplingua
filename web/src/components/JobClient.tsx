@@ -133,6 +133,9 @@ export default function JobClient({
 
   const canSubmit = useMemo(() => ytUrl.trim().length > 0 && !busy, [ytUrl, busy]);
 
+  const [ytUploading, setYtUploading] = useState(false);
+  const [ytUploadedUrl, setYtUploadedUrl] = useState<string | null>(null);
+
   const clearTimer = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = null;
@@ -448,6 +451,41 @@ export default function JobClient({
     }
   }
 
+  async function uploadDubToYouTube(lang: string) {
+    if (!jobId) return;
+
+    setMsg(null);
+    setYtUploadedUrl(null);
+    setYtUploading(true);
+
+    try {
+      const token = await getAccessToken();
+      if (!token) throw new Error("Please sign in first.");
+
+      const res = await fetch("/api/youtube/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ jobId, lang, privacyStatus: "unlisted" }),
+      });
+
+      const text = await res.text();
+      const data = parseJsonSafe<any>(text) ?? {};
+
+      if (!res.ok) throw new Error(String(data?.error || text || `Request failed (${res.status})`));
+
+      const url = String(data?.url || "").trim();
+      if (!url) throw new Error("No YouTube URL returned");
+
+      setYtUploadedUrl(url);
+      setMsg(`Uploaded to YouTube: ${url}`);
+      safeOpen(url);
+    } catch (e: any) {
+      setMsg(e?.message || "YouTube upload failed");
+    } finally {
+      setYtUploading(false);
+    }
+  }
+
   const dubState = readDubState(job, selectedLang);
   const baseDone = job?.status === "done";
 
@@ -612,7 +650,24 @@ export default function JobClient({
                   >
                     {downloading === "dub_log" ? "Preparing..." : "Download dub log"}
                   </button>
+
+                  <button
+                    onClick={() => uploadDubToYouTube(selectedLang)}
+                    className="border rounded-md px-4 py-2 disabled:opacity-60"
+                    disabled={!ytConnected || dubState.status !== "done" || ytUploading || !!downloading}
+                  >
+                    {ytUploading ? "Uploading..." : "Upload to YouTube"}
+                  </button>
                 </div>
+                {ytUploadedUrl && (
+                  <p className="mt-2 text-sm">
+                    YouTube:{" "}
+                    <a className="underline" href={ytUploadedUrl} target="_blank" rel="noreferrer">
+                      {ytUploadedUrl}
+                    </a>
+                  </p>
+                )}
+
               </div>
             </>
           )}
