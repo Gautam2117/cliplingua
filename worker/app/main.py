@@ -31,6 +31,7 @@ import subprocess
 import re
 import wave
 import math
+import textwrap
 import numpy as np
 
 from pathlib import Path
@@ -1799,6 +1800,88 @@ def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
                     
                     if not merged:
                         raise RuntimeError("no usable segments after merge")
+
+                    import textwrap
+
+                    def _ass_escape(s: str) -> str:
+                        # ASS reserved chars
+                        s = s.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+                        # ASS line breaks
+                        s = s.replace("\n", " ").strip()
+                        return s
+
+                    def build_ass(subs, out_ass_path: str, style_id: str, play_res=(1080, 1920)):
+                        """
+                        subs: list of dicts like:
+                        { "start": 1.23, "end": 2.80, "text": "..." }
+                        """
+                        W, H = play_res
+
+                        # Safe margins so nothing touches edges
+                        margin_lr = 80
+                        margin_v = 90
+
+                        # Style mapping for your captionStyle values
+                        if style_id == "big":
+                            font_size = 70
+                            outline = 5
+                            box = False
+                        elif style_id == "boxed":
+                            font_size = 56
+                            outline = 3
+                            box = True
+                        elif style_id == "bold":
+                            font_size = 56
+                            outline = 4
+                            box = False
+                        else:  # clean
+                            font_size = 52
+                            outline = 3
+                            box = False
+
+                        # Wrapping: tune this if needed
+                        # Larger font -> fewer chars per line
+                        wrap_width = 28 if font_size >= 65 else 34
+
+                        header = f"""[Script Info]
+                    ScriptType: v4.00+
+                    PlayResX: {W}
+                    PlayResY: {H}
+                    WrapStyle: 2
+                    ScaledBorderAndShadow: yes
+
+                    [V4+ Styles]
+                    Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+                    Style: Default,Arial,{font_size},&H00FFFFFF,&H000000FF,&H00101010,&H7F000000,0,0,0,0,100,100,0,0,{3 if box else 1},{outline},0,2,{margin_lr},{margin_lr},{margin_v},1
+
+                    [Events]
+                    Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+                    """
+
+                        def fmt_time(t: float) -> str:
+                            # h:mm:ss.cs
+                            if t < 0: t = 0
+                            h = int(t // 3600)
+                            m = int((t % 3600) // 60)
+                            s = t % 60
+                            cs = int(round((s - int(s)) * 100))
+                            return f"{h}:{m:02d}:{int(s):02d}.{cs:02d}"
+
+                        lines = [header]
+                        for seg in subs:
+                            start = fmt_time(float(seg["start"]))
+                            end = fmt_time(float(seg["end"]))
+                            raw = str(seg.get("text", "")).strip()
+                            if not raw:
+                                continue
+
+                            wrapped = textwrap.fill(raw, width=wrap_width)
+                            text = _ass_escape(wrapped).replace("\n", r"\N")
+
+                            lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n")
+
+                        with open(out_ass_path, "w", encoding="utf-8") as f:
+                            f.writelines(lines)
 
                     # Optional: cap segments for speed
                     max_segments = int(os.getenv("MAX_DUB_SEGMENTS", "140"))
