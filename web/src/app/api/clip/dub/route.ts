@@ -8,6 +8,7 @@ export const maxDuration = 120;
 type Body = {
   jobId?: string;
   lang?: string;
+  captionStyle?: string;
 };
 
 function getWorkerBaseUrl() {
@@ -49,6 +50,7 @@ export async function POST(req: Request) {
     const body = (await req.json().catch(() => ({}))) as Body;
     const jobId = String(body.jobId || "").trim();
     const lang = String(body.lang || "").trim();
+    const captionStyle = String(body.captionStyle || "clean").trim();
 
     if (!jobId) return NextResponse.json({ error: "Missing jobId" }, { status: 400 });
     if (!lang) return NextResponse.json({ error: "Missing lang" }, { status: 400 });
@@ -83,7 +85,7 @@ export async function POST(req: Request) {
     const r = await fetch(`${base}/jobs/${encodeURIComponent(jobId)}/dub`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ lang }),
+      body: JSON.stringify({ lang, captionStyle }),
       cache: "no-store",
       signal: AbortSignal.timeout(90_000),
     });

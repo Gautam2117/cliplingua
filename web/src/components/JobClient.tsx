@@ -37,6 +37,15 @@ const LANGS = [
 
 type DubState = { status: "not_started" | "running" | "done" | "error"; error?: string | null };
 
+const CAPTION_STYLES = [
+  { id: "clean", label: "Clean" },
+  { id: "bold", label: "Bold" },
+  { id: "boxed", label: "Boxed" },
+  { id: "big", label: "Big" },
+] as const;
+
+type CaptionStyle = (typeof CAPTION_STYLES)[number]["id"];
+
 function readDubState(job: Job | null, lang: string): DubState {
   const raw = job?.dub_status?.[lang];
   if (!raw) return { status: "not_started" };
@@ -89,6 +98,8 @@ export default function JobClient({
   const [downloading, setDownloading] = useState<AnyArtifactType | null>(null);
 
   const [selectedLang, setSelectedLang] = useState<(typeof LANGS)[number]["code"]>("hi");
+  const [captionStyle, setCaptionStyle] = useState<CaptionStyle>("clean");
+
   const [dubBusy, setDubBusy] = useState(false);
 
   const [activeDubLang, setActiveDubLang] = useState<string | null>(null);
@@ -293,7 +304,7 @@ export default function JobClient({
       const res = await fetch("/api/clip/dub", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ jobId, lang }),
+        body: JSON.stringify({ jobId, lang, captionStyle }),
       });
 
       const text = await res.text();
@@ -409,6 +420,19 @@ export default function JobClient({
                     {LANGS.map((l) => (
                       <option key={l.code} value={l.code}>
                         {l.label} ({l.code})
+                      </option>
+                    ))}
+                  </select>
+
+                  <select
+                    className="border rounded-md px-3 py-2 text-sm"
+                    value={captionStyle}
+                    onChange={(e) => setCaptionStyle(e.target.value as CaptionStyle)}
+                    disabled={dubBusy}
+                  >
+                    {CAPTION_STYLES.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        Captions: {s.label}
                       </option>
                     ))}
                   </select>

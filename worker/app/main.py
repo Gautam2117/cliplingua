@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import re
 import wave
+import math
 import numpy as np
 
 from pathlib import Path
@@ -42,7 +43,7 @@ import threading
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, FileResponse, Response
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -95,11 +96,78 @@ app = FastAPI(title="ClipLingua Worker", version="0.9.0-timed-dub")
 # Helpers
 # -----------------------------------------------------------------------------
 
+def srt_ts(sec: float) -> str:
+    sec = max(0.0, float(sec))
+    whole = math.floor(sec)
+    ms = int(round((sec - whole) * 1000.0))
+    h = int(whole // 3600)
+    m = int((whole % 3600) // 60)
+    s = int(whole % 60)
+
+    if ms >= 1000:
+        ms -= 1000
+        s += 1
+        if s >= 60:
+            s = 0
+            m += 1
+            if m >= 60:
+                m = 0
+                h += 1
+
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def write_srt(entries: List[Dict[str, Any]], out_path: Path) -> None:
+    lines: List[str] = []
+    for i, e in enumerate(entries, start=1):
+        lines.append(str(i))
+        lines.append(f"{srt_ts(e['start'])} --> {srt_ts(e['end'])}")
+        lines.append((e.get("text") or "").strip())
+        lines.append("")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines), encoding="utf-8", errors="ignore")
+
+CAPTION_STYLE_FORCE = {
+    "clean": "Fontname=DejaVu Sans,Fontsize=28,Outline=2,Shadow=0,MarginV=58",
+    "bold":  "Fontname=DejaVu Sans,Fontsize=30,Bold=1,Outline=3,Shadow=0,MarginV=58",
+    "boxed": "Fontname=DejaVu Sans,Fontsize=28,Outline=2,Shadow=0,BackColour=&H80000000,BorderStyle=3,MarginV=58",
+    "big":   "Fontname=DejaVu Sans,Fontsize=36,Bold=1,Outline=3,Shadow=0,MarginV=70",
+}
+
+def burn_captions(video_in: Path, srt_path: Path, video_out: Path, caption_style: str, log_fn=None) -> None:
+    ffmpeg = require_bin("ffmpeg")
+    style = CAPTION_STYLE_FORCE.get(caption_style, CAPTION_STYLE_FORCE["clean"])
+
+    # Escape path for ffmpeg subtitles filter on linux
+    p = str(srt_path).replace("\\", "/").replace(":", "\\:")
+    vf = f"subtitles='{p}':force_style='{style}'"
+
+    cmd = [
+        ffmpeg, "-y",
+        "-i", str(video_in),
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "copy",
+        str(video_out),
+    ]
+    rc, out = run_cmd(cmd, cwd=None)
+    if log_fn:
+        log_fn("== ffmpeg burn captions ==")
+        log_fn(out)
+    if rc != 0 or (not video_out.exists()) or video_out.stat().st_size < 10_000:
+        tail = "\n".join(out.splitlines()[-200:])
+        raise RuntimeError(f"burn captions failed (rc={rc})\n{tail}")
+
 def wav_duration_seconds(path: Path) -> float:
     with wave.open(str(path), "rb") as wf:
         frames = wf.getnframes()
         sr = wf.getframerate()
     return float(frames) / float(sr) if sr else 0.0
+
+def safe_move(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
 
 def make_silence_wav(duration_s: float, out_wav: Path) -> None:
     duration_s = float(duration_s)
@@ -807,8 +875,8 @@ def process_job(job_id: str, url: str) -> None:
             raise RuntimeError("audio wav not ready")
 
         paths["video"].parent.mkdir(parents=True, exist_ok=True)
-        merged_video.replace(paths["video"])
-        tmp_audio.replace(paths["audio"])
+        safe_move(merged_video, paths["video"])
+        safe_move(tmp_audio, paths["audio"])
 
         out_log.write_text("\n".join(log_lines), encoding="utf-8", errors="ignore")
         sb_append_log(job_id, "\n== DONE ==\n")
@@ -1257,7 +1325,7 @@ def ffmpeg_concat_wavs(inputs: List[Path], out_wav: Path, log_fn=None) -> None:
     if not inputs:
         raise RuntimeError("concat: no inputs")
     if len(inputs) == 1:
-        inputs[0].replace(out_wav)
+        safe_move(inputs[0], out_wav)
         return
 
     ffmpeg = require_bin("ffmpeg")
@@ -1493,7 +1561,7 @@ def ensure_base_artifacts_local(job_id: str, job: Dict[str, Any]) -> Tuple[Path,
 # Dubbing
 # -----------------------------------------------------------------------------
 
-def process_dub(job_id: str, lang: str) -> None:
+def process_dub(job_id: str, lang: str, caption_style: str = "clean") -> None:
     lang = (lang or "").strip().lower()
     if lang not in SUPPORTED_DUB_LANGS:
         sb_upsert_dub_status(job_id, lang, "error", error="unsupported lang")
@@ -1502,6 +1570,12 @@ def process_dub(job_id: str, lang: str) -> None:
     dd = dub_dir(job_id, lang)
     dd.mkdir(parents=True, exist_ok=True)
     local_log_path = dub_log_path(job_id, lang)
+
+    caption_style = (caption_style or "clean").strip().lower()
+    if caption_style not in CAPTION_STYLE_FORCE:
+        caption_style = "clean"
+
+    srt_path = dd / "captions.srt"
 
     def log(line: str) -> None:
         line = line.rstrip()
@@ -1541,7 +1615,13 @@ def process_dub(job_id: str, lang: str) -> None:
 
         log(f"speaker_f0_hz={speaker_f0} speaker_gender={speaker_gender}")
 
-        if out_audio.exists() and out_video.exists() and out_audio.stat().st_size > 2048 and out_video.stat().st_size > 10_000:
+        if (
+            out_audio.exists()
+            and out_video.exists()
+            and srt_path.exists()
+            and out_audio.stat().st_size > 2048
+            and out_video.stat().st_size > 10_000
+        ):
             log("cached=true (local dub exists)")
         else:
             ffmpeg = require_bin("ffmpeg")
@@ -1579,6 +1659,8 @@ def process_dub(job_id: str, lang: str) -> None:
 
                 log(f"building_timed_audio segments={len(merged)}")
 
+                subs: List[Dict[str, Any]] = []
+
                 for idx, s in enumerate(merged):
                     start = float(s.get("start", 0.0))
                     end = float(s.get("end", 0.0))
@@ -1602,7 +1684,7 @@ def process_dub(job_id: str, lang: str) -> None:
                     seg_tr = (seg_tr or "").strip()
                     if not seg_tr:
                         seg_tr = seg_text  # fallback to avoid accidental silence
-
+                    subs.append({"start": start, "end": end, "text": seg_tr})
                     seg_raw = seg_tmp_dir / f"seg_{idx:04d}_raw.wav"
                     seg_fit = seg_tmp_dir / f"seg_{idx:04d}_fit.wav"
 
@@ -1623,6 +1705,9 @@ def process_dub(job_id: str, lang: str) -> None:
 
                     prev_end = max(prev_end, end)
 
+                if subs:
+                    write_srt(subs, srt_path)
+
                 if not timeline_parts:
                     raise RuntimeError("no timeline parts generated")
 
@@ -1634,11 +1719,18 @@ def process_dub(job_id: str, lang: str) -> None:
                 pad_or_trim_to_video_length(stitched, video_in, final, log_fn=None)
 
                 normalize_audio(final, log_fn=log)
-                final.replace(out_audio)
+                safe_move(final, out_audio)
 
 
                 log("muxing_audio_into_video...")
-                mux_audio_into_video(video_in, out_audio, out_video, log_fn=log)
+                tmp_video = dd / "video_with_audio.mp4"
+                mux_audio_into_video(video_in, out_audio, tmp_video, log_fn=log)
+
+                if subs:
+                    log(f"burning_captions style={caption_style} ...")
+                    burn_captions(tmp_video, srt_path, out_video, caption_style, log_fn=log)
+                else:
+                    tmp_video.replace(out_video)
 
                 if not out_video.exists() or out_video.stat().st_size < 10_000:
                     raise RuntimeError("dub video not generated")
@@ -1648,6 +1740,10 @@ def process_dub(job_id: str, lang: str) -> None:
                 # Fallback: full text TTS
                 log("timed_dub_unavailable=true (fallback to full-text TTS)")
                 translated = src_text if lang == "en" else translate_text(src_text, lang)
+                vd = video_duration_seconds(video_in) or 0.0
+                end_ts = vd if vd > 0 else float(merged[-1]["end"]) if merged else 5.0
+                write_srt([{"start": 0.0, "end": end_ts, "text": translated}], srt_path)
+
                 if not translated.strip():
                     raise RuntimeError("translation empty")
 
@@ -1658,7 +1754,11 @@ def process_dub(job_id: str, lang: str) -> None:
                 normalize_audio(out_audio, log_fn=log)
 
                 log("muxing_audio_into_video...")
-                mux_audio_into_video(video_in, out_audio, out_video, log_fn=log)
+                tmp_video = dd / "video_with_audio.mp4"
+                mux_audio_into_video(video_in, out_audio, tmp_video, log_fn=log)
+
+                log(f"burning_captions style={caption_style} ...")
+                burn_captions(tmp_video, srt_path, out_video, caption_style, log_fn=log)
 
                 if not out_video.exists() or out_video.stat().st_size < 10_000:
                     raise RuntimeError("dub video not generated")
@@ -1669,6 +1769,9 @@ def process_dub(job_id: str, lang: str) -> None:
         audio_key = sb_upload_file(job_id, out_audio, f"dubs/{lang}/audio.wav", "audio/wav")
         video_key = sb_upload_file(job_id, out_video, f"dubs/{lang}/video.mp4", "video/mp4")
         log_key = sb_upload_file(job_id, local_log_path, f"dubs/{lang}/log.txt", "text/plain")
+
+        srt_key = sb_upload_file(job_id, srt_path, f"dubs/{lang}/captions.srt", "text/plain")
+
         log("uploaded_to_storage=true")
 
         sb_upsert_dub_status(job_id, lang, "done", error=None, audio_key=audio_key, video_key=video_key, log_key=log_key)
@@ -1695,6 +1798,7 @@ class CreateJobBody(BaseModel):
 
 class DubBody(BaseModel):
     lang: str
+    caption_style: str = Field(default="clean", alias="captionStyle")
 
 @app.get("/health")
 def health():
@@ -1819,11 +1923,16 @@ def get_job_video(job_id: str):
 @app.post("/jobs/{job_id}/dub")
 def dub_job(job_id: str, body: DubBody):
     lang = (body.lang or "").strip().lower()
+    caption_style = (body.caption_style or "clean").strip().lower()
+
     if lang not in SUPPORTED_DUB_LANGS:
         raise HTTPException(status_code=400, detail="unsupported lang (use hi/en/es)")
+
     _ = load_job_for_artifacts(job_id)
     write_dub_status(job_id, lang, "queued")
-    threading.Thread(target=process_dub, args=(job_id, lang), daemon=True).start()
+
+    threading.Thread(target=process_dub, args=(job_id, lang, caption_style), daemon=True).start()
+
     return {
         "ok": True,
         "lang": lang,
