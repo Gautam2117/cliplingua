@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { OAuth2Client } from "google-auth-library";
-import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { supabaseAdmin } from "@/lib/supabase-admin";
 import { verifyYTState } from "@/lib/ytState";
 
 export const runtime = "nodejs";
