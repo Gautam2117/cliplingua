@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getUserFromBearer } from "@/lib/supabaseUserFromBearer";
-import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { supabaseAdmin } from "@/lib/supabase-admin";
  
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
