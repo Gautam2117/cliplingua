@@ -31,28 +31,21 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
-async function safeRefund(sb: ReturnType<typeof supabaseAuthed>, amount: number) {
-  try {
-    await sb.rpc("refund_credits", { amount });
-  } catch {
-    // ignore
-  }
-}
-
-async function ensureActiveOrgId(sb: ReturnType<typeof supabaseAuthed>, userId: string) {
+async function getActiveOrgId(sb: ReturnType<typeof supabaseAuthed>, userId: string) {
+  // Always read from profile (never trust RPC return value)
   const { data: prof, error: profErr } = await sb
     .from("profiles")
     .select("active_org_id")
     .eq("id", userId)
     .single();
 
-  if (profErr) throw new Error(profErr.message);
+  if (profErr) throw new Error(`Failed to load profile: ${profErr.message}`);
 
   let orgId = (prof as any)?.active_org_id as string | null;
 
   if (!orgId) {
     const { error: bootErr } = await sb.rpc("bootstrap_org");
-    if (bootErr) throw new Error(bootErr.message);
+    if (bootErr) throw new Error(`bootstrap_org failed: ${bootErr.message}`);
 
     const { data: prof2, error: profErr2 } = await sb
       .from("profiles")
@@ -60,7 +53,7 @@ async function ensureActiveOrgId(sb: ReturnType<typeof supabaseAuthed>, userId: 
       .eq("id", userId)
       .single();
 
-    if (profErr2) throw new Error(profErr2.message);
+    if (profErr2) throw new Error(`Failed to reload profile: ${profErr2.message}`);
 
     orgId = (prof2 as any)?.active_org_id as string | null;
   }
@@ -69,9 +62,43 @@ async function ensureActiveOrgId(sb: ReturnType<typeof supabaseAuthed>, userId: 
   return orgId;
 }
 
+async function reserveCredits(sb: ReturnType<typeof supabaseAuthed>, workerJobId: string, amount: number) {
+  // Try new org-job credit RPC first, fallback to legacy reserve_credits
+  const { error: e1 } = await sb.rpc("reserve_job_credits", { worker_job_id: workerJobId, amount });
+  if (!e1) return { method: "job" as const };
+
+  const msg = (e1.message || "").toLowerCase();
+  const fnMissing = msg.includes("could not find the function") || msg.includes("pgrst202");
+  if (!fnMissing) return { method: "job" as const, error: e1 };
+
+  const { error: e2 } = await sb.rpc("reserve_credits", { amount });
+  if (!e2) return { method: "org" as const };
+
+  return { method: "org" as const, error: e2 };
+}
+
+async function refundCredits(
+  sb: ReturnType<typeof supabaseAuthed>,
+  workerJobId: string,
+  amount: number,
+  method: "job" | "org"
+) {
+  try {
+    if (method === "job") {
+      await sb.rpc("refund_job_credits", { worker_job_id: workerJobId, amount });
+    } else {
+      await sb.rpc("refund_credits", { amount });
+    }
+  } catch {
+    // ignore
+  }
+}
+
 export async function POST(req: Request) {
   const COST = 1;
-  let reserved = false;
+
+  let workerJobId = "";
+  let reserved: { method: "job" | "org" } | null = null;
 
   try {
     const token = getBearer(req);
@@ -86,25 +113,17 @@ export async function POST(req: Request) {
     const { data: u, error: uErr } = await sb.auth.getUser();
     if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
-    const orgId = await ensureActiveOrgId(sb, u.user.id);
-
-    const { error: reserveErr } = await sb.rpc("reserve_credits", { amount: COST });
-    if (reserveErr) {
-      const msg = reserveErr.message?.toLowerCase().includes("insufficient")
-        ? "Insufficient credits"
-        : reserveErr.message;
-      return NextResponse.json({ error: msg }, { status: 402 });
-    }
-    reserved = true;
-
+    const orgId = await getActiveOrgId(sb, u.user.id);
     const workerBase = getWorkerBaseUrl();
 
+    // Warmup worker (Render cold start)
     try {
       await fetchWithTimeout(`${workerBase}/health`, { cache: "no-store" }, 10_000);
     } catch {
       // ignore
     }
 
+    // Create worker job first
     const r = await fetchWithTimeout(
       `${workerBase}/jobs`,
       {
@@ -124,33 +143,77 @@ export async function POST(req: Request) {
       worker = { raw: text };
     }
 
-    const workerJobId = String(worker?.jobId || worker?.id || "").trim();
+    workerJobId = String(worker?.jobId || worker?.id || "").trim();
 
     if (!r.ok || !workerJobId) {
-      if (reserved) await safeRefund(sb, COST);
       return NextResponse.json(
         { error: "Worker create job failed", workerStatus: r.status, workerBody: worker },
         { status: 502 }
       );
     }
 
+    // Insert job row first with credits_spent = 0 (so you always see the job)
     const { error: insErr } = await sb.from("user_jobs").insert({
       user_id: u.user.id,
       org_id: orgId,
       youtube_url: url,
       worker_job_id: workerJobId,
       status: "submitted",
-      credits_spent: COST,
+      credits_spent: 0,
     });
 
     if (insErr) {
-      if (reserved) await safeRefund(sb, COST);
       return NextResponse.json({ error: insErr.message }, { status: 500 });
     }
 
-    return NextResponse.json({ jobId: workerJobId });
+    // Reserve credits tied to this job (or fallback)
+    const res = await reserveCredits(sb, workerJobId, COST);
+    if ((res as any).error) {
+      const e = (res as any).error;
+      const msg = (e.message || "").toLowerCase().includes("insufficient") ? "Insufficient credits" : e.message;
+
+      // Mark job as error (optional but helps UI)
+      await sb
+        .from("user_jobs")
+        .update({ status: "error" })
+        .eq("worker_job_id", workerJobId)
+        .eq("org_id", orgId);
+
+      return NextResponse.json({ error: msg, workerJobId }, { status: 402 });
+    }
+
+    reserved = { method: res.method };
+
+    // Update credits_spent now that reservation succeeded
+    const { error: upErr } = await sb
+      .from("user_jobs")
+      .update({ credits_spent: COST })
+      .eq("worker_job_id", workerJobId)
+      .eq("org_id", orgId);
+
+    if (upErr) {
+      await refundCredits(sb, workerJobId, COST, reserved.method);
+      return NextResponse.json({ error: upErr.message }, { status: 500 });
+    }
+
+    return NextResponse.json({ jobId: workerJobId, orgId });
   } catch (e: any) {
     const isAbort = e?.name === "AbortError";
-    return NextResponse.json({ error: isAbort ? "Worker timeout" : e?.message || "Submit failed" }, { status: 500 });
+
+    // Best-effort refund if something exploded after reserve
+    try {
+      const token = getBearer(req);
+      if (token && workerJobId && reserved) {
+        const sb = supabaseAuthed(token);
+        await refundCredits(sb, workerJobId, COST, reserved.method);
+      }
+    } catch {
+      // ignore
+    }
+
+    return NextResponse.json(
+      { error: isAbort ? "Worker timeout" : e?.message || "Submit failed" },
+      { status: 500 }
+    );
   }
 }
