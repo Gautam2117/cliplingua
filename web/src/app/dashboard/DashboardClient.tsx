@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -41,7 +42,9 @@ export default function DashboardClient() {
   const [joining, setJoining] = useState(false);
 
   async function syncRecentStatuses(token: string, rows: JobRow[]) {
-    const candidates = rows.filter((r) => r.status !== "done" && r.status !== "error").slice(0, 10);
+    const candidates = rows
+      .filter((r) => r.status !== "done" && r.status !== "error")
+      .slice(0, 10);
 
     await Promise.allSettled(
       candidates.map(async (r) => {
@@ -205,6 +208,19 @@ export default function DashboardClient() {
         <div className="flex items-start justify-between gap-3">
           <div>
             <h1 className="text-3xl font-bold">Dashboard</h1>
+
+            {/* NAV LINKS */}
+            <div className="mt-4 flex gap-3 text-sm">
+              <Link className="underline" href="/dashboard">
+                Dashboard
+              </Link>
+              <Link className="underline" href="/dashboard/team">
+                Team
+              </Link>
+              <Link className="underline" href="/dashboard/api-keys">
+                API keys
+              </Link>
+            </div>
 
             <div className="mt-2 text-sm opacity-80 space-y-1">
               {org ? (

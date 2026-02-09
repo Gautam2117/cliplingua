@@ -32,18 +32,29 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 
 async function ensureActiveOrg(sb: ReturnType<typeof supabaseAuthed>, userId: string) {
-  const { data: prof, error } = await sb.from("profiles").select("active_org_id").eq("id", userId).single();
+  const { data: prof, error } = await sb
+    .from("profiles")
+    .select("active_org_id")
+    .eq("id", userId)
+    .single();
+
   if (error) throw new Error(error.message);
 
   let orgId = (prof as any)?.active_org_id as string | null;
+
   if (!orgId) {
     const { data: boot, error: bootErr } = await sb.rpc("bootstrap_org");
     if (bootErr) throw new Error(bootErr.message);
+
     const maybeOrg = String(boot || "").trim();
     if (maybeOrg) orgId = maybeOrg;
 
     if (!orgId) {
-      const { data: prof2, error: error2 } = await sb.from("profiles").select("active_org_id").eq("id", userId).single();
+      const { data: prof2, error: error2 } = await sb
+        .from("profiles")
+        .select("active_org_id")
+        .eq("id", userId)
+        .single();
       if (error2) throw new Error(error2.message);
       orgId = (prof2 as any)?.active_org_id as string | null;
     }
@@ -73,21 +84,21 @@ export async function POST(req: Request) {
     const { data: u, error: uErr } = await sb.auth.getUser();
     if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
+    // IMPORTANT: store in constants so nested functions do not lose TS narrowing
+    const userId = u.user.id;
+
     const body = await req.json();
     const urls: string[] = Array.isArray(body?.urls) ? body.urls : [];
     const concurrency = Math.min(Math.max(Number(body?.concurrency || 3), 1), 6);
 
-    const clean = urls
-      .map((x) => String(x || "").trim())
-      .filter(Boolean);
+    const clean = urls.map((x) => String(x || "").trim()).filter(Boolean);
 
     if (clean.length === 0) return NextResponse.json({ error: "Provide urls: string[]" }, { status: 400 });
     if (clean.length > 50) return NextResponse.json({ error: "Max 50 URLs per request" }, { status: 400 });
 
-    const orgId = await ensureActiveOrg(sb, u.user.id);
+    const orgId = await ensureActiveOrg(sb, userId);
     const workerBase = getWorkerBaseUrl();
 
-    // simple worker pool
     const results: any[] = [];
     let idx = 0;
 
@@ -109,7 +120,11 @@ export async function POST(req: Request) {
 
         const txt = await r.text();
         let parsed: any = null;
-        try { parsed = JSON.parse(txt); } catch { parsed = { raw: txt }; }
+        try {
+          parsed = JSON.parse(txt);
+        } catch {
+          parsed = { raw: txt };
+        }
 
         workerJobId = String(parsed?.jobId || parsed?.id || "").trim();
         if (!r.ok || !workerJobId) {
@@ -131,7 +146,7 @@ export async function POST(req: Request) {
         reserved = true;
 
         const { error: insErr } = await sb.from("user_jobs").insert({
-          user_id: u.user.id,
+          user_id: userId,
           org_id: orgId,
           youtube_url: url,
           worker_job_id: workerJobId,
@@ -163,12 +178,7 @@ export async function POST(req: Request) {
     const workers = Array.from({ length: Math.min(concurrency, clean.length) }, () => workerLoop());
     await Promise.all(workers);
 
-    return NextResponse.json({
-      ok: true,
-      orgId,
-      count: clean.length,
-      results,
-    });
+    return NextResponse.json({ ok: true, orgId, count: clean.length, results });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || "Bulk submit failed" }, { status: 500 });
   }
