@@ -1,6 +1,9 @@
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { useRouter, useSearchParams } from "next/navigation";
 import JobClient from "@/components/JobClient";
@@ -28,7 +31,7 @@ type JobRow = {
   org_id: string;
 };
 
-export default function DashboardPage() {
+function DashboardInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -68,7 +71,6 @@ export default function DashboardPage() {
       const { data: boot, error: bootErr } = await supabase.rpc("bootstrap_org");
       if (bootErr) throw new Error(bootErr.message);
 
-      // After bootstrap, re-fetch profile to get active_org_id updated
       const { data: prof2, error: profErr2 } = await supabase
         .from("profiles")
         .select("id,email,active_org_id")
@@ -110,7 +112,6 @@ export default function DashboardPage() {
 
     const uid = userData.user.id;
 
-    // Ensure org exists and is active
     let orgId = "";
     try {
       orgId = await ensureOrgActive(uid);
@@ -119,7 +120,6 @@ export default function DashboardPage() {
       return;
     }
 
-    // Load org
     const { data: orgRow, error: orgErr } = await supabase
       .from("organizations")
       .select("id,name,credits,invite_code")
@@ -132,7 +132,6 @@ export default function DashboardPage() {
     }
     setOrg(orgRow as any);
 
-    // Load jobs scoped to org
     const { data: jobRows, error: jobsErr } = await supabase
       .from("user_jobs")
       .select("id,youtube_url,worker_job_id,status,credits_spent,created_at,org_id")
@@ -148,18 +147,17 @@ export default function DashboardPage() {
     const rows = (jobRows || []) as any as JobRow[];
     setJobs(rows);
 
-    // Best effort status refresh
     try {
       await syncRecentStatuses(token, rows);
 
-      const { data: fresh, error: freshErr } = await supabase
+      const { data: fresh } = await supabase
         .from("user_jobs")
         .select("id,youtube_url,worker_job_id,status,credits_spent,created_at,org_id")
         .eq("org_id", orgId)
         .order("created_at", { ascending: false })
         .limit(20);
 
-      if (!freshErr && fresh) setJobs(fresh as any);
+      if (fresh) setJobs(fresh as any);
     } catch {
       // ignore
     }
@@ -241,12 +239,7 @@ export default function DashboardPage() {
               placeholder="Enter invite code"
               className="border rounded-md px-3 py-2 w-full"
             />
-            <button
-              onClick={joinOrg}
-              disabled={joining}
-              className="border rounded-md px-4 py-2"
-              title="Join org"
-            >
+            <button onClick={joinOrg} disabled={joining} className="border rounded-md px-4 py-2">
               {joining ? "Joining..." : "Join"}
             </button>
           </div>
@@ -287,5 +280,13 @@ export default function DashboardPage() {
         {msg && <p className="mt-5 text-sm opacity-80 whitespace-pre-wrap">{msg}</p>}
       </div>
     </main>
+  );
+}
+
+export default function DashboardPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen px-6 py-10">Loading...</div>}>
+      <DashboardInner />
+    </Suspense>
   );
 }
