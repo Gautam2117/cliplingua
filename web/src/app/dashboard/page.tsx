@@ -1,7 +1,7 @@
+"use client";
+
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
-
-"use client";
 
 import { Suspense, useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
@@ -68,7 +68,7 @@ function DashboardInner() {
     let activeOrgId = (prof as any)?.active_org_id as string | null;
 
     if (!activeOrgId) {
-      const { data: boot, error: bootErr } = await supabase.rpc("bootstrap_org");
+      const { error: bootErr } = await supabase.rpc("bootstrap_org");
       if (bootErr) throw new Error(bootErr.message);
 
       const { data: prof2, error: profErr2 } = await supabase
@@ -86,7 +86,6 @@ function DashboardInner() {
     }
 
     if (!activeOrgId) throw new Error("active_org_id missing after bootstrap");
-
     return activeOrgId;
   }
 
