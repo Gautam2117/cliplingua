@@ -11,7 +11,12 @@ function getBearer(req: Request) {
 }
 
 async function ensureActiveOrg(sb: ReturnType<typeof supabaseAuthed>, userId: string) {
-  const { data: prof, error } = await sb.from("profiles").select("active_org_id").eq("id", userId).single();
+  const { data: prof, error } = await sb
+    .from("profiles")
+    .select("active_org_id")
+    .eq("id", userId)
+    .single();
+
   if (error) throw new Error(error.message);
 
   let orgId = (prof as any)?.active_org_id as string | null;
@@ -20,7 +25,12 @@ async function ensureActiveOrg(sb: ReturnType<typeof supabaseAuthed>, userId: st
     const { error: bootErr } = await sb.rpc("bootstrap_org");
     if (bootErr) throw new Error(bootErr.message);
 
-    const { data: prof2, error: error2 } = await sb.from("profiles").select("active_org_id").eq("id", userId).single();
+    const { data: prof2, error: error2 } = await sb
+      .from("profiles")
+      .select("active_org_id")
+      .eq("id", userId)
+      .single();
+
     if (error2) throw new Error(error2.message);
 
     orgId = (prof2 as any)?.active_org_id as string | null;
@@ -28,6 +38,28 @@ async function ensureActiveOrg(sb: ReturnType<typeof supabaseAuthed>, userId: st
 
   if (!orgId) throw new Error("active_org_id missing");
   return orgId;
+}
+
+async function enforceApiEnabled(sb: ReturnType<typeof supabaseAuthed>, orgId: string) {
+  const { data: orgRow, error: orgErr } = await sb
+    .from("organizations")
+    .select("api_enabled,plan")
+    .eq("id", orgId)
+    .single();
+
+  if (orgErr) {
+    return { ok: false as const, status: 400, message: orgErr.message };
+  }
+
+  if (!orgRow?.api_enabled) {
+    return {
+      ok: false as const,
+      status: 403,
+      message: "Plan does not include Bulk API (upgrade to Agency)",
+    };
+  }
+
+  return { ok: true as const };
 }
 
 export async function GET(req: Request) {
@@ -41,6 +73,7 @@ export async function GET(req: Request) {
 
     const orgId = await ensureActiveOrg(sb, u.user.id);
 
+    // GET can remain ungated: show keys if any (or empty list)
     const { data, error } = await sb
       .from("org_api_keys")
       .select("prefix,name,created_at,revoked_at")
@@ -68,14 +101,17 @@ export async function POST(req: Request) {
     const { data: u, error: uErr } = await sb.auth.getUser();
     if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
+    const orgId = await ensureActiveOrg(sb, u.user.id);
+
+    // Agency gating (Bulk API)
+    const gate = await enforceApiEnabled(sb, orgId);
+    if (!gate.ok) return NextResponse.json({ error: gate.message }, { status: gate.status });
+
     // Your SQL patch provides create_org_api_key
     const res = await sb.rpc("create_org_api_key", { name });
     if (res.error) return NextResponse.json({ error: res.error.message }, { status: 400 });
 
-    const apiKey =
-      String((res.data as any)?.api_key || "") ||
-      String((res.data as any)?.apiKey || "");
-
+    const apiKey = String((res.data as any)?.api_key || "") || String((res.data as any)?.apiKey || "");
     if (!apiKey.trim()) return NextResponse.json({ error: "Key create returned empty" }, { status: 500 });
 
     return NextResponse.json({ apiKey: apiKey.trim() });
@@ -96,6 +132,12 @@ export async function DELETE(req: Request) {
     const sb = supabaseAuthed(token);
     const { data: u, error: uErr } = await sb.auth.getUser();
     if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
+
+    const orgId = await ensureActiveOrg(sb, u.user.id);
+
+    // Agency gating (Bulk API)
+    const gate = await enforceApiEnabled(sb, orgId);
+    if (!gate.ok) return NextResponse.json({ error: gate.message }, { status: gate.status });
 
     const res = await sb.rpc("revoke_org_api_key", { prefix });
     if (res.error) return NextResponse.json({ error: res.error.message }, { status: 400 });

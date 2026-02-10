@@ -111,8 +111,20 @@ export async function POST(req: Request) {
     const { data: u, error: uErr } = await sb.auth.getUser();
     if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
-    const userId = u.user.id;
-    const orgId = await getActiveOrgId(sb, userId);
+    const uid = u.user.id;
+
+    // Step 3: Resolve org via bootstrap_org (keeps dashboard flow working)
+    const { data: orgId, error: orgErr } = await sb.rpc("bootstrap_org");
+    if (orgErr || !orgId) {
+      return NextResponse.json({ error: "Failed to resolve org" }, { status: 500 });
+    }
+
+    // Keep this if other parts rely on active_org_id being populated
+    // (and as a fallback if your RPC only returns org id in some cases)
+    // Not strictly required after bootstrap_org, but harmless.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const _activeOrgId = await getActiveOrgId(sb, uid).catch(() => null);
+
     const workerBase = getWorkerBaseUrl();
 
     // Warmup worker (Render cold start)
@@ -152,7 +164,7 @@ export async function POST(req: Request) {
 
     // Insert job row first so UI can show it even if credits fail
     const { error: insErr } = await sb.from("user_jobs").insert({
-      user_id: userId,
+      user_id: uid,
       org_id: orgId,
       youtube_url: url,
       worker_job_id: workerJobId,
@@ -202,9 +214,6 @@ export async function POST(req: Request) {
       // ignore
     }
 
-    return NextResponse.json(
-      { error: isAbort ? "Worker timeout" : e?.message || "Submit failed" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: isAbort ? "Worker timeout" : e?.message || "Submit failed" }, { status: 500 });
   }
 }
