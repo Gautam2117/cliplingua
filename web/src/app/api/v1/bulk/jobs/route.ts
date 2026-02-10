@@ -1,3 +1,4 @@
+// src/app/api/v1/bulk/jobs/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAuthed } from "@/lib/supabase-server";
 
@@ -32,39 +33,26 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 
 async function ensureActiveOrg(sb: ReturnType<typeof supabaseAuthed>, userId: string) {
-  const { data: prof, error } = await sb
-    .from("profiles")
-    .select("active_org_id")
-    .eq("id", userId)
-    .single();
-
+  const { data: prof, error } = await sb.from("profiles").select("active_org_id").eq("id", userId).single();
   if (error) throw new Error(error.message);
 
   let orgId = (prof as any)?.active_org_id as string | null;
 
   if (!orgId) {
-    const { data: boot, error: bootErr } = await sb.rpc("bootstrap_org");
+    const { error: bootErr } = await sb.rpc("bootstrap_org");
     if (bootErr) throw new Error(bootErr.message);
 
-    const maybeOrg = String(boot || "").trim();
-    if (maybeOrg) orgId = maybeOrg;
+    const { data: prof2, error: err2 } = await sb.from("profiles").select("active_org_id").eq("id", userId).single();
+    if (err2) throw new Error(err2.message);
 
-    if (!orgId) {
-      const { data: prof2, error: error2 } = await sb
-        .from("profiles")
-        .select("active_org_id")
-        .eq("id", userId)
-        .single();
-      if (error2) throw new Error(error2.message);
-      orgId = (prof2 as any)?.active_org_id as string | null;
-    }
+    orgId = (prof2 as any)?.active_org_id as string | null;
   }
 
   if (!orgId) throw new Error("active_org_id missing");
   return orgId;
 }
 
-async function safeRefund(sb: ReturnType<typeof supabaseAuthed>, workerJobId: string, amount: number) {
+async function safeRefundJob(sb: ReturnType<typeof supabaseAuthed>, workerJobId: string, amount: number) {
   try {
     await sb.rpc("refund_job_credits", { worker_job_id: workerJobId, amount });
   } catch {
@@ -81,11 +69,12 @@ export async function POST(req: Request) {
 
     const sb = supabaseAuthed(token);
 
-    const { data: u, error: uErr } = await sb.auth.getUser();
-    if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
+    // IMPORTANT: const user for TS narrowing
+    const { data: userRes, error: uErr } = await sb.auth.getUser();
+    const user = userRes.user;
+    if (uErr || !user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
-    // IMPORTANT: store in constants so nested functions do not lose TS narrowing
-    const userId = u.user.id;
+    const userId = user.id;
 
     const body = await req.json();
     const urls: string[] = Array.isArray(body?.urls) ? body.urls : [];
@@ -131,6 +120,7 @@ export async function POST(req: Request) {
           return { url, ok: false, error: "Worker create failed", workerStatus: r.status, workerBody: parsed };
         }
 
+        // Reserve org credits tied to this worker job
         const { error: reserveErr } = await sb.rpc("reserve_job_credits", {
           worker_job_id: workerJobId,
           amount: COST,
@@ -155,13 +145,13 @@ export async function POST(req: Request) {
         });
 
         if (insErr) {
-          if (reserved) await safeRefund(sb, workerJobId, COST);
+          if (reserved) await safeRefundJob(sb, workerJobId, COST);
           return { url, ok: false, error: insErr.message, workerJobId };
         }
 
         return { url, ok: true, workerJobId };
       } catch (e: any) {
-        if (workerJobId && reserved) await safeRefund(sb, workerJobId, COST);
+        if (workerJobId && reserved) await safeRefundJob(sb, workerJobId, COST);
         const isAbort = e?.name === "AbortError";
         return { url, ok: false, error: isAbort ? "Worker timeout" : e?.message || "Failed" };
       }

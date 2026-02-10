@@ -1,3 +1,4 @@
+// src/app/api/clip/submit/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAuthed } from "@/lib/supabase-server";
 
@@ -32,7 +33,6 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 
 async function getActiveOrgId(sb: ReturnType<typeof supabaseAuthed>, userId: string) {
-  // Always read from profile (never trust RPC return value)
   const { data: prof, error: profErr } = await sb
     .from("profiles")
     .select("active_org_id")
@@ -63,18 +63,18 @@ async function getActiveOrgId(sb: ReturnType<typeof supabaseAuthed>, userId: str
 }
 
 async function reserveCredits(sb: ReturnType<typeof supabaseAuthed>, workerJobId: string, amount: number) {
-  // Try new org-job credit RPC first, fallback to legacy reserve_credits
-  const { error: e1 } = await sb.rpc("reserve_job_credits", { worker_job_id: workerJobId, amount });
-  if (!e1) return { method: "job" as const };
+  // Prefer job-tied RPC (org-level). If missing, fallback to reserve_credits (org-aware in your Day6 SQL).
+  const r1 = await sb.rpc("reserve_job_credits", { worker_job_id: workerJobId, amount });
+  if (!r1.error) return { method: "job" as const };
 
-  const msg = (e1.message || "").toLowerCase();
+  const msg = (r1.error.message || "").toLowerCase();
   const fnMissing = msg.includes("could not find the function") || msg.includes("pgrst202");
-  if (!fnMissing) return { method: "job" as const, error: e1 };
+  if (!fnMissing) return { method: "job" as const, error: r1.error };
 
-  const { error: e2 } = await sb.rpc("reserve_credits", { amount });
-  if (!e2) return { method: "org" as const };
+  const r2 = await sb.rpc("reserve_credits", { amount });
+  if (!r2.error) return { method: "org" as const };
 
-  return { method: "org" as const, error: e2 };
+  return { method: "org" as const, error: r2.error };
 }
 
 async function refundCredits(
@@ -110,10 +110,13 @@ export async function POST(req: Request) {
 
     const sb = supabaseAuthed(token);
 
-    const { data: u, error: uErr } = await sb.auth.getUser();
-    if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
+    // IMPORTANT: store user in const so TS narrowing persists
+    const { data: userRes, error: uErr } = await sb.auth.getUser();
+    const user = userRes.user;
+    if (uErr || !user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
-    const orgId = await getActiveOrgId(sb, u.user.id);
+    const userId = user.id;
+    const orgId = await getActiveOrgId(sb, userId);
     const workerBase = getWorkerBaseUrl();
 
     // Warmup worker (Render cold start)
@@ -152,9 +155,9 @@ export async function POST(req: Request) {
       );
     }
 
-    // Insert job row first with credits_spent = 0 (so you always see the job)
+    // Insert job row first with credits_spent = 0 (so it appears even if credits fail)
     const { error: insErr } = await sb.from("user_jobs").insert({
-      user_id: u.user.id,
+      user_id: userId,
       org_id: orgId,
       youtube_url: url,
       worker_job_id: workerJobId,
@@ -166,13 +169,12 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: insErr.message }, { status: 500 });
     }
 
-    // Reserve credits tied to this job (or fallback)
+    // Reserve credits tied to workerJobId (or fallback to org-aware reserve_credits)
     const res = await reserveCredits(sb, workerJobId, COST);
     if ((res as any).error) {
       const e = (res as any).error;
       const msg = (e.message || "").toLowerCase().includes("insufficient") ? "Insufficient credits" : e.message;
 
-      // Mark job as error (optional but helps UI)
       await sb
         .from("user_jobs")
         .update({ status: "error" })
@@ -200,7 +202,7 @@ export async function POST(req: Request) {
   } catch (e: any) {
     const isAbort = e?.name === "AbortError";
 
-    // Best-effort refund if something exploded after reserve
+    // Best-effort refund if we already reserved
     try {
       const token = getBearer(req);
       if (token && workerJobId && reserved) {

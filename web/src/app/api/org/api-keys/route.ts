@@ -1,3 +1,4 @@
+// src/app/api/org/api-keys/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAuthed } from "@/lib/supabase-server";
 
@@ -15,17 +16,15 @@ async function ensureActiveOrg(sb: ReturnType<typeof supabaseAuthed>, userId: st
   if (error) throw new Error(error.message);
 
   let orgId = (prof as any)?.active_org_id as string | null;
-  if (!orgId) {
-    const { data: boot, error: bootErr } = await sb.rpc("bootstrap_org");
-    if (bootErr) throw new Error(bootErr.message);
-    const maybeOrg = String(boot || "").trim();
-    if (maybeOrg) orgId = maybeOrg;
 
-    if (!orgId) {
-      const { data: prof2, error: error2 } = await sb.from("profiles").select("active_org_id").eq("id", userId).single();
-      if (error2) throw new Error(error2.message);
-      orgId = (prof2 as any)?.active_org_id as string | null;
-    }
+  if (!orgId) {
+    const { error: bootErr } = await sb.rpc("bootstrap_org");
+    if (bootErr) throw new Error(bootErr.message);
+
+    const { data: prof2, error: err2 } = await sb.from("profiles").select("active_org_id").eq("id", userId).single();
+    if (err2) throw new Error(err2.message);
+
+    orgId = (prof2 as any)?.active_org_id as string | null;
   }
 
   if (!orgId) throw new Error("active_org_id missing");
@@ -48,10 +47,13 @@ export async function GET(req: Request) {
     if (!token) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
     const sb = supabaseAuthed(token);
-    const { data: u, error: uErr } = await sb.auth.getUser();
-    if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
-    const orgId = await ensureActiveOrg(sb, u.user.id);
+    // IMPORTANT: const user for TS narrowing
+    const { data: userRes, error: uErr } = await sb.auth.getUser();
+    const user = userRes.user;
+    if (uErr || !user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
+
+    const orgId = await ensureActiveOrg(sb, user.id);
 
     const { data, error } = await sb
       .from("org_api_keys")
@@ -77,13 +79,16 @@ export async function POST(req: Request) {
     if (!name) return NextResponse.json({ error: "Missing name" }, { status: 400 });
 
     const sb = supabaseAuthed(token);
-    const { data: u, error: uErr } = await sb.auth.getUser();
-    if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
-    // create key RPC name can vary based on your SQL
+    // IMPORTANT: const user for TS narrowing
+    const { data: userRes, error: uErr } = await sb.auth.getUser();
+    const user = userRes.user;
+    if (uErr || !user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
+
+    // Your patched SQL guarantees create_org_api_key exists
     const res = await rpcTry(sb, ["create_org_api_key", "create_api_key"], { name });
 
-    const apiKey = String((res.data as any)?.api_key || (res.data as any)?.apiKey || (res.data as any) || "").trim();
+    const apiKey = String((res.data as any)?.api_key || (res.data as any)?.apiKey || "").trim();
     if (!apiKey) return NextResponse.json({ error: "Key create returned empty" }, { status: 500 });
 
     return NextResponse.json({ apiKey });
@@ -102,8 +107,11 @@ export async function DELETE(req: Request) {
     if (!prefix) return NextResponse.json({ error: "Missing prefix" }, { status: 400 });
 
     const sb = supabaseAuthed(token);
-    const { data: u, error: uErr } = await sb.auth.getUser();
-    if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
+
+    // IMPORTANT: const user for TS narrowing
+    const { data: userRes, error: uErr } = await sb.auth.getUser();
+    const user = userRes.user;
+    if (uErr || !user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
     await rpcTry(sb, ["revoke_org_api_key", "revoke_api_key"], { prefix });
 
