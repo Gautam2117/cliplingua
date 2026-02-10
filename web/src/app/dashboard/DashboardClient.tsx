@@ -1,23 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { supabase } from "@/lib/supabase";
 import JobClient from "@/components/JobClient";
-
-type Profile = {
-  id: string;
-  email: string | null;
-  active_org_id: string | null;
-};
-
-type Org = {
-  id: string;
-  name: string;
-  credits: number;
-  invite_code: string;
-};
+import { ensureActiveOrg, loadOrgContext, requireAuthedSession, type OrgContext, type OrgPlan } from "@/lib/org-client";
 
 type JobRow = {
   id: string;
@@ -29,22 +17,80 @@ type JobRow = {
   org_id: string;
 };
 
+function planLabel(p: OrgPlan | null) {
+  if (!p) return "free";
+  return p;
+}
+
+function planBadgeClasses(p: OrgPlan | null) {
+  const base = "inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-semibold";
+  if (p === "agency_plus") return `${base} bg-black text-white border-black`;
+  if (p === "agency") return `${base} bg-white text-black border-black`;
+  if (p === "creator") return `${base} bg-white text-black border-gray-300`;
+  return `${base} bg-white text-black border-gray-200`;
+}
+
+function clampPct(n: number) {
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, n));
+}
+
+declare global {
+  interface Window {
+    Razorpay?: any;
+  }
+}
+
+async function loadRazorpayScript(): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  if (window.Razorpay) return true;
+
+  await new Promise<void>((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://checkout.razorpay.com/v1/checkout.js";
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("Failed to load Razorpay"));
+    document.body.appendChild(s);
+  });
+
+  return !!window.Razorpay;
+}
+
 export default function DashboardClient() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
-  const [profile, setProfile] = useState<Profile | null>(null);
-  const [org, setOrg] = useState<Org | null>(null);
+  const [ctx, setCtx] = useState<OrgContext | null>(null);
   const [jobs, setJobs] = useState<JobRow[]>([]);
   const [msg, setMsg] = useState<string | null>(null);
 
   const [joinCode, setJoinCode] = useState("");
   const [joining, setJoining] = useState(false);
 
-  async function syncRecentStatuses(token: string, rows: JobRow[]) {
-    const candidates = rows
-      .filter((r) => r.status !== "done" && r.status !== "error")
-      .slice(0, 10);
+  const seatsUsed = ctx?.membersUsed ?? 0;
+  const seatsPurchased = ctx?.seatsPurchased ?? 0;
+  const seatsPct = useMemo(() => {
+    if (!seatsPurchased) return 0;
+    return clampPct((seatsUsed / seatsPurchased) * 100);
+  }, [seatsUsed, seatsPurchased]);
+
+  const apiMinutePct = useMemo(() => {
+    const used = ctx?.api.minuteUsed ?? 0;
+    const limit = ctx?.api.minuteLimit ?? 0;
+    if (!limit) return 0;
+    return clampPct((used / limit) * 100);
+  }, [ctx]);
+
+  const apiDailyPct = useMemo(() => {
+    const used = ctx?.api.dailyUsed ?? 0;
+    const limit = ctx?.api.dailyLimit ?? 0;
+    if (!limit) return 0;
+    return clampPct((used / limit) * 100);
+  }, [ctx]);
+
+  const syncRecentStatuses = useCallback(async (token: string, rows: JobRow[]) => {
+    const candidates = rows.filter((r) => r.status !== "done" && r.status !== "error").slice(0, 10);
 
     await Promise.allSettled(
       candidates.map(async (r) => {
@@ -54,42 +100,9 @@ export default function DashboardClient() {
         });
       })
     );
-  }
+  }, []);
 
-  async function ensureOrgActive(userId: string) {
-    const { data: prof, error: profErr } = await supabase
-      .from("profiles")
-      .select("id,email,active_org_id")
-      .eq("id", userId)
-      .single();
-
-    if (profErr) throw new Error(profErr.message);
-
-    let activeOrgId = (prof as any)?.active_org_id as string | null;
-
-    if (!activeOrgId) {
-      const { error: bootErr } = await supabase.rpc("bootstrap_org");
-      if (bootErr) throw new Error(bootErr.message);
-
-      const { data: prof2, error: profErr2 } = await supabase
-        .from("profiles")
-        .select("id,email,active_org_id")
-        .eq("id", userId)
-        .single();
-
-      if (profErr2) throw new Error(profErr2.message);
-
-      setProfile(prof2 as any);
-      activeOrgId = (prof2 as any)?.active_org_id as string | null;
-    } else {
-      setProfile(prof as any);
-    }
-
-    if (!activeOrgId) throw new Error("active_org_id missing after bootstrap");
-    return activeOrgId;
-  }
-
-  async function load() {
+  const load = useCallback(async () => {
     setMsg(null);
 
     const joinError = searchParams?.get("join_error");
@@ -101,41 +114,32 @@ export default function DashboardClient() {
       }
     }
 
-    const { data: sess } = await supabase.auth.getSession();
-    const token = sess.session?.access_token;
-
-    if (!sess.session || !token) {
+    let token = "";
+    let uid = "";
+    try {
+      const s = await requireAuthedSession();
+      token = s.token;
+      uid = s.user.id;
+    } catch {
       router.replace("/login");
       return;
     }
-
-    const { data: userData, error: userErr } = await supabase.auth.getUser();
-    if (userErr || !userData.user) {
-      router.replace("/login");
-      return;
-    }
-
-    const uid = userData.user.id;
 
     let orgId = "";
     try {
-      orgId = await ensureOrgActive(uid);
+      orgId = await ensureActiveOrg(uid);
     } catch (e: any) {
       setMsg(e?.message || "Failed to ensure organization");
       return;
     }
 
-    const { data: orgRow, error: orgErr } = await supabase
-      .from("organizations")
-      .select("id,name,credits,invite_code")
-      .eq("id", orgId)
-      .single();
-
-    if (orgErr) {
-      setMsg(orgErr.message);
+    try {
+      const c = await loadOrgContext(orgId);
+      setCtx(c);
+    } catch (e: any) {
+      setMsg(e?.message || "Failed to load org");
       return;
     }
-    setOrg(orgRow as any);
 
     const { data: jobRows, error: jobsErr } = await supabase
       .from("user_jobs")
@@ -166,16 +170,28 @@ export default function DashboardClient() {
     } catch {
       // ignore
     }
-  }
+  }, [router, searchParams, syncRecentStatuses]);
 
   useEffect(() => {
     load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [load]);
 
   async function signOut() {
     await supabase.auth.signOut();
     router.replace("/login");
+  }
+
+  async function copyInvite() {
+    const code = ctx?.org.invite_code || "";
+    if (!code) return;
+
+    try {
+      await navigator.clipboard.writeText(code);
+      setMsg("Invite code copied");
+      setTimeout(() => setMsg(null), 1500);
+    } catch {
+      setMsg("Copy failed (clipboard blocked)");
+    }
   }
 
   async function joinOrg() {
@@ -189,10 +205,7 @@ export default function DashboardClient() {
     setJoining(true);
     try {
       const { error } = await supabase.rpc("join_org", { invite_code: code });
-      if (error) {
-        setMsg(error.message);
-        return;
-      }
+      if (error) throw new Error(error.message);
       setJoinCode("");
       await load();
     } catch (e: any) {
@@ -202,41 +215,175 @@ export default function DashboardClient() {
     }
   }
 
+  // Optional billing wiring:
+  // - POST /api/billing/create-order { kind: "seats", seatsDelta: number } or { kind: "api" }
+  // - POST /api/billing/verify with razorpay response
+  async function startSeatUpgrade(seatsDelta: number) {
+    setMsg(null);
+
+    const ok = await loadRazorpayScript().catch((e) => {
+      setMsg(e?.message || "Razorpay failed to load");
+      return false;
+    });
+    if (!ok) return;
+
+    let token = "";
+    try {
+      token = (await requireAuthedSession()).token;
+    } catch {
+      router.replace("/login");
+      return;
+    }
+
+    const r = await fetch("/api/billing/create-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ kind: "seats", seatsDelta }),
+    });
+
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      setMsg(String(j?.error || "Failed to create order"));
+      return;
+    }
+
+    const rz = new window.Razorpay({
+      key: j.razorpayKeyId,
+      amount: j.amount,
+      currency: j.currency || "INR",
+      order_id: j.razorpayOrderId,
+      name: "ClipLingua",
+      description: `Upgrade seats (+${seatsDelta})`,
+      handler: async (resp: any) => {
+        const vr = await fetch("/api/billing/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            orgOrderId: j.orgOrderId,
+            razorpay_order_id: resp.razorpay_order_id,
+            razorpay_payment_id: resp.razorpay_payment_id,
+            razorpay_signature: resp.razorpay_signature,
+          }),
+        });
+
+        const vj = await vr.json().catch(() => ({}));
+        if (!vr.ok) {
+          setMsg(String(vj?.error || "Payment verify failed"));
+          return;
+        }
+        setMsg("Seats upgraded.");
+        await load();
+      },
+      modal: { ondismiss: () => setMsg("Payment cancelled") },
+    });
+
+    rz.open();
+  }
+
+  async function enableApiPaid() {
+    setMsg(null);
+
+    const ok = await loadRazorpayScript().catch((e) => {
+      setMsg(e?.message || "Razorpay failed to load");
+      return false;
+    });
+    if (!ok) return;
+
+    let token = "";
+    try {
+      token = (await requireAuthedSession()).token;
+    } catch {
+      router.replace("/login");
+      return;
+    }
+
+    const r = await fetch("/api/billing/create-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ kind: "api" }),
+    });
+
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      setMsg(String(j?.error || "Failed to create order"));
+      return;
+    }
+
+    const rz = new window.Razorpay({
+      key: j.razorpayKeyId,
+      amount: j.amount,
+      currency: j.currency || "INR",
+      order_id: j.razorpayOrderId,
+      name: "ClipLingua",
+      description: "Enable Bulk API",
+      handler: async (resp: any) => {
+        const vr = await fetch("/api/billing/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            orgOrderId: j.orgOrderId,
+            razorpay_order_id: resp.razorpay_order_id,
+            razorpay_payment_id: resp.razorpay_payment_id,
+            razorpay_signature: resp.razorpay_signature,
+          }),
+        });
+
+        const vj = await vr.json().catch(() => ({}));
+        if (!vr.ok) {
+          setMsg(String(vj?.error || "Payment verify failed"));
+          return;
+        }
+        setMsg("API enabled.");
+        await load();
+      },
+      modal: { ondismiss: () => setMsg("Payment cancelled") },
+    });
+
+    rz.open();
+  }
+
   return (
     <main className="min-h-screen px-6 py-10">
-      <div className="max-w-3xl mx-auto">
+      <div className="max-w-4xl mx-auto">
         <div className="flex items-start justify-between gap-3">
           <div>
             <h1 className="text-3xl font-bold">Dashboard</h1>
 
-            {/* NAV LINKS */}
             <div className="mt-4 flex gap-3 text-sm">
-              <Link className="underline" href="/dashboard">
-                Dashboard
-              </Link>
-              <Link className="underline" href="/dashboard/team">
-                Team
-              </Link>
-              <Link className="underline" href="/dashboard/api-keys">
-                API keys
-              </Link>
+              <Link className="underline" href="/dashboard">Dashboard</Link>
+              <Link className="underline" href="/dashboard/team">Team</Link>
+              <Link className="underline" href="/dashboard/api-keys">API keys</Link>
             </div>
 
-            <div className="mt-2 text-sm opacity-80 space-y-1">
-              {org ? (
+            <div className="mt-3 text-sm opacity-85 space-y-1">
+              {ctx ? (
                 <>
-                  <p>
-                    Org: <span className="font-semibold">{org.name}</span> · Credits:{" "}
-                    <span className="font-semibold">{org.credits}</span>
-                  </p>
-                  <p className="text-xs opacity-80">
-                    Invite code: <span className="font-mono">{org.invite_code}</span>
-                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p>
+                      Org: <span className="font-semibold">{ctx.org.name}</span>
+                    </p>
+                    <span className={planBadgeClasses(ctx.org.plan)}>{planLabel(ctx.org.plan)}</span>
+                    {ctx.isAdmin && (
+                      <span className="text-xs opacity-70 border rounded-full px-2.5 py-1">admin</span>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p>
+                      Credits: <span className="font-semibold">{ctx.org.credits}</span>
+                    </p>
+
+                    <span className="text-xs opacity-80">
+                      Invite code: <span className="font-mono">{ctx.org.invite_code}</span>
+                    </span>
+
+                    <button onClick={copyInvite} className="border rounded-md px-3 py-1 text-xs">
+                      Copy
+                    </button>
+                  </div>
                 </>
-              ) : profile ? (
-                <p>Loading org...</p>
               ) : (
-                <p>Loading...</p>
+                <p>Loading org...</p>
               )}
             </div>
           </div>
@@ -246,9 +393,88 @@ export default function DashboardClient() {
           </button>
         </div>
 
+        {/* PLAN / SEATS / API */}
+        <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="border rounded-xl p-5">
+            <p className="text-sm opacity-70">Plan</p>
+            <p className="mt-2 text-xl font-semibold">{ctx ? planLabel(ctx.org.plan) : "-"}</p>
+            <p className="mt-1 text-xs opacity-70">Pricing lever: seats + API limits</p>
+          </div>
+
+          <div className="border rounded-xl p-5">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm opacity-70">Seats</p>
+              {ctx?.isAdmin && (
+                <button
+                  onClick={() => startSeatUpgrade(1)}
+                  className="border rounded-md px-3 py-1 text-xs"
+                  disabled={!ctx}
+                >
+                  Upgrade +1
+                </button>
+              )}
+            </div>
+
+            <p className="mt-2 text-xl font-semibold">
+              {ctx ? `${seatsUsed} / ${Math.max(1, seatsPurchased)}` : "-"}
+            </p>
+
+            <div className="mt-3 h-2 w-full rounded-full bg-gray-100 overflow-hidden">
+              <div className="h-full bg-black" style={{ width: `${seatsPurchased ? seatsPct : 0}%` }} />
+            </div>
+
+            <p className="mt-2 text-xs opacity-70">Members count / seats purchased</p>
+          </div>
+
+          <div className="border rounded-xl p-5">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm opacity-70">Bulk API</p>
+              {ctx?.isAdmin && !ctx.api.enabled && (
+                <button onClick={enableApiPaid} className="border rounded-md px-3 py-1 text-xs">
+                  Enable
+                </button>
+              )}
+              {ctx?.api.enabled && <span className="text-xs opacity-70 border rounded-full px-2.5 py-1">enabled</span>}
+            </div>
+
+            {ctx ? (
+              <>
+                <div className="mt-3">
+                  <div className="flex items-center justify-between text-xs opacity-80">
+                    <span>Minute</span>
+                    <span className="font-mono">
+                      {ctx.api.minuteUsed}/{ctx.api.minuteLimit || "-"}
+                    </span>
+                  </div>
+                  <div className="mt-2 h-2 w-full rounded-full bg-gray-100 overflow-hidden">
+                    <div className="h-full bg-black" style={{ width: `${ctx.api.minuteLimit ? apiMinutePct : 0}%` }} />
+                  </div>
+                </div>
+
+                <div className="mt-4">
+                  <div className="flex items-center justify-between text-xs opacity-80">
+                    <span>Daily jobs</span>
+                    <span className="font-mono">
+                      {ctx.api.dailyUsed}/{ctx.api.dailyLimit || "-"}
+                    </span>
+                  </div>
+                  <div className="mt-2 h-2 w-full rounded-full bg-gray-100 overflow-hidden">
+                    <div className="h-full bg-black" style={{ width: `${ctx.api.dailyLimit ? apiDailyPct : 0}%` }} />
+                  </div>
+                </div>
+
+                <p className="mt-2 text-xs opacity-70">Live counters from org_api_usage</p>
+              </>
+            ) : (
+              <p className="mt-2 text-sm opacity-70">Loading...</p>
+            )}
+          </div>
+        </div>
+
+        {/* JOIN ORG */}
         <div className="mt-6 border rounded-xl p-6">
-          <h2 className="text-lg font-semibold">Agency mode</h2>
-          <p className="text-sm opacity-70 mt-1">Join an organization using an invite code.</p>
+          <h2 className="text-lg font-semibold">Join an organization</h2>
+          <p className="text-sm opacity-70 mt-1">Switch your active org by invite code.</p>
 
           <div className="mt-4 flex gap-2">
             <input
@@ -263,7 +489,8 @@ export default function DashboardClient() {
           </div>
         </div>
 
-        <div className="mt-8 border rounded-xl p-6">
+        {/* CREATE JOB */}
+        <div className="mt-6 border rounded-xl p-6">
           <h2 className="text-lg font-semibold">Create a job</h2>
           <p className="text-sm opacity-70 mt-1">Each job costs 1 credit for now (charged to org).</p>
           <div className="mt-4">
@@ -271,7 +498,8 @@ export default function DashboardClient() {
           </div>
         </div>
 
-        <div className="mt-8 border rounded-xl p-6">
+        {/* RECENT JOBS */}
+        <div className="mt-6 border rounded-xl p-6">
           <h2 className="text-lg font-semibold">Recent jobs</h2>
 
           {jobs.length === 0 ? (
@@ -280,12 +508,17 @@ export default function DashboardClient() {
             <div className="mt-4 space-y-3">
               {jobs.map((j) => (
                 <div key={j.id} className="border rounded-lg p-4">
-                  <p className="text-sm">
-                    <span className="font-semibold">Status:</span> {j.status}
-                  </p>
-                  <p className="text-sm mt-1 break-all">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm">
+                      <span className="font-semibold">Status:</span> {j.status}
+                    </p>
+                    <p className="text-xs opacity-70">{new Date(j.created_at).toLocaleString()}</p>
+                  </div>
+
+                  <p className="text-sm mt-2 break-all">
                     <span className="font-semibold">URL:</span> {j.youtube_url}
                   </p>
+
                   <p className="text-xs opacity-70 mt-2">
                     Worker job id: <span className="font-mono">{j.worker_job_id}</span>
                   </p>
