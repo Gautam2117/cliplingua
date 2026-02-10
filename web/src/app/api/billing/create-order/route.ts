@@ -1,12 +1,9 @@
-// src/app/api/billing/create-order/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAuthed } from "@/lib/supabase-server";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 import { getUserFromBearer } from "@/lib/supabaseUserFromBearer";
 
 export const runtime = "nodejs";
-
-type Body = { kind: "seats" | "api"; seatsDelta?: number };
 
 function jsonError(message: string, status = 400) {
   return NextResponse.json({ error: message }, { status });
@@ -21,9 +18,10 @@ export async function POST(req: Request) {
     const user = await getUserFromBearer(token);
     if (!user) return jsonError("Not authenticated", 401);
 
-    const body = (await req.json().catch(() => null)) as Body | null;
-    if (!body?.kind) return jsonError("Missing kind", 400);
-    if (body.kind !== "seats" && body.kind !== "api") return jsonError("Invalid kind", 400);
+    const body = await req.json().catch(() => null);
+    const kind = body?.kind;
+
+    if (kind !== "seats" && kind !== "api") return jsonError("Invalid kind", 400);
 
     const sb = supabaseAuthed(token);
 
@@ -48,16 +46,16 @@ export async function POST(req: Request) {
     if (!Number.isFinite(seatPriceInr) || seatPriceInr <= 0) return jsonError("Bad SEAT_PRICE_INR", 500);
     if (!Number.isFinite(apiPriceInr) || apiPriceInr <= 0) return jsonError("Bad API_ENABLE_PRICE_INR", 500);
 
-    const seatsDeltaRaw = body.kind === "seats" ? Number(body.seatsDelta || 0) : 0;
+    const seatsDeltaRaw = kind === "seats" ? Number(body?.seatsDelta || 0) : 0;
     const seatsDelta = Math.max(0, Math.floor(seatsDeltaRaw));
 
-    if (body.kind === "seats") {
+    if (kind === "seats") {
       if (seatsDelta <= 0) return jsonError("seatsDelta must be >= 1", 400);
       if (seatsDelta > 100) return jsonError("seatsDelta too large", 400);
     }
 
-    if (body.kind === "api") {
-      // Optional guard: if already enabled, do not charge again
+    if (kind === "api") {
+      // Optional: block double purchase
       const { data: orgRow, error: oErr } = await sb
         .from("organizations")
         .select("api_enabled")
@@ -67,7 +65,7 @@ export async function POST(req: Request) {
       if (orgRow?.api_enabled) return jsonError("API already enabled", 400);
     }
 
-    const amountInr = body.kind === "seats" ? seatsDelta * seatPriceInr : apiPriceInr;
+    const amountInr = kind === "seats" ? seatsDelta * seatPriceInr : apiPriceInr;
     if (!Number.isFinite(amountInr) || amountInr <= 0) return jsonError("Invalid amount", 400);
 
     const keyId = process.env.RAZORPAY_KEY_ID || "";
@@ -75,8 +73,6 @@ export async function POST(req: Request) {
     if (!keyId || !keySecret) return jsonError("Razorpay keys missing", 500);
 
     const amountPaise = amountInr * 100;
-
-    const receipt = `org_${orgId}_${Date.now()}`;
 
     const rp = await fetch("https://api.razorpay.com/v1/orders", {
       method: "POST",
@@ -87,13 +83,9 @@ export async function POST(req: Request) {
       body: JSON.stringify({
         amount: amountPaise,
         currency: "INR",
-        receipt,
+        receipt: `org_${orgId}_${Date.now()}`,
         payment_capture: 1,
-        notes: {
-          orgId,
-          kind: body.kind,
-          seatsDelta: String(seatsDelta),
-        },
+        notes: { orgId, kind, seatsDelta: String(seatsDelta) },
       }),
     });
 
@@ -108,7 +100,7 @@ export async function POST(req: Request) {
       .from("org_orders")
       .insert({
         org_id: orgId,
-        kind: body.kind,
+        kind,
         seats_delta: seatsDelta,
         amount_paise: amountPaise,
         provider: "razorpay",
