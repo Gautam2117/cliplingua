@@ -1,4 +1,3 @@
-// src/app/api/clip/submit/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAuthed } from "@/lib/supabase-server";
 
@@ -54,7 +53,6 @@ async function getActiveOrgId(sb: ReturnType<typeof supabaseAuthed>, userId: str
       .single();
 
     if (profErr2) throw new Error(`Failed to reload profile: ${profErr2.message}`);
-
     orgId = (prof2 as any)?.active_org_id as string | null;
   }
 
@@ -62,19 +60,19 @@ async function getActiveOrgId(sb: ReturnType<typeof supabaseAuthed>, userId: str
   return orgId;
 }
 
-async function reserveCredits(sb: ReturnType<typeof supabaseAuthed>, workerJobId: string, amount: number) {
-  // Prefer job-tied RPC (org-level). If missing, fallback to reserve_credits (org-aware in your Day6 SQL).
+async function reserveJobCredits(sb: ReturnType<typeof supabaseAuthed>, workerJobId: string, amount: number) {
+  // Prefer reserve_job_credits if present, fallback to reserve_credits
   const r1 = await sb.rpc("reserve_job_credits", { worker_job_id: workerJobId, amount });
-  if (!r1.error) return { method: "job" as const };
+  if (!r1.error) return { ok: true as const, method: "job" as const };
 
   const msg = (r1.error.message || "").toLowerCase();
   const fnMissing = msg.includes("could not find the function") || msg.includes("pgrst202");
-  if (!fnMissing) return { method: "job" as const, error: r1.error };
+  if (!fnMissing) return { ok: false as const, method: "job" as const, error: r1.error };
 
   const r2 = await sb.rpc("reserve_credits", { amount });
-  if (!r2.error) return { method: "org" as const };
+  if (!r2.error) return { ok: true as const, method: "org" as const };
 
-  return { method: "org" as const, error: r2.error };
+  return { ok: false as const, method: "org" as const, error: r2.error };
 }
 
 async function refundCredits(
@@ -85,10 +83,10 @@ async function refundCredits(
 ) {
   try {
     if (method === "job") {
-      await sb.rpc("refund_job_credits", { worker_job_id: workerJobId, amount });
-    } else {
-      await sb.rpc("refund_credits", { amount });
+      const r1 = await sb.rpc("refund_job_credits", { worker_job_id: workerJobId, amount });
+      if (!r1.error) return;
     }
+    await sb.rpc("refund_credits", { amount });
   } catch {
     // ignore
   }
@@ -98,7 +96,7 @@ export async function POST(req: Request) {
   const COST = 1;
 
   let workerJobId = "";
-  let reserved: { method: "job" | "org" } | null = null;
+  let reservedMethod: "job" | "org" | null = null;
 
   try {
     const token = getBearer(req);
@@ -110,12 +108,10 @@ export async function POST(req: Request) {
 
     const sb = supabaseAuthed(token);
 
-    // IMPORTANT: store user in const so TS narrowing persists
-    const { data: userRes, error: uErr } = await sb.auth.getUser();
-    const user = userRes.user;
-    if (uErr || !user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
+    const { data: u, error: uErr } = await sb.auth.getUser();
+    if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
-    const userId = user.id;
+    const userId = u.user.id;
     const orgId = await getActiveOrgId(sb, userId);
     const workerBase = getWorkerBaseUrl();
 
@@ -138,16 +134,15 @@ export async function POST(req: Request) {
       90_000
     );
 
-    const text = await r.text();
+    const raw = await r.text();
     let worker: any = null;
     try {
-      worker = JSON.parse(text);
+      worker = JSON.parse(raw);
     } catch {
-      worker = { raw: text };
+      worker = { raw };
     }
 
     workerJobId = String(worker?.jobId || worker?.id || "").trim();
-
     if (!r.ok || !workerJobId) {
       return NextResponse.json(
         { error: "Worker create job failed", workerStatus: r.status, workerBody: worker },
@@ -155,7 +150,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // Insert job row first with credits_spent = 0 (so it appears even if credits fail)
+    // Insert job row first so UI can show it even if credits fail
     const { error: insErr } = await sb.from("user_jobs").insert({
       user_id: userId,
       org_id: orgId,
@@ -165,28 +160,23 @@ export async function POST(req: Request) {
       credits_spent: 0,
     });
 
-    if (insErr) {
-      return NextResponse.json({ error: insErr.message }, { status: 500 });
-    }
+    if (insErr) return NextResponse.json({ error: insErr.message }, { status: 500 });
 
-    // Reserve credits tied to workerJobId (or fallback to org-aware reserve_credits)
-    const res = await reserveCredits(sb, workerJobId, COST);
-    if ((res as any).error) {
-      const e = (res as any).error;
-      const msg = (e.message || "").toLowerCase().includes("insufficient") ? "Insufficient credits" : e.message;
+    // Reserve credits
+    const res = await reserveJobCredits(sb, workerJobId, COST);
+    if (!res.ok) {
+      const msg = (res.error?.message || "").toLowerCase().includes("insufficient")
+        ? "Insufficient credits"
+        : res.error?.message || "Credit reserve failed";
 
-      await sb
-        .from("user_jobs")
-        .update({ status: "error" })
-        .eq("worker_job_id", workerJobId)
-        .eq("org_id", orgId);
+      await sb.from("user_jobs").update({ status: "error" }).eq("worker_job_id", workerJobId).eq("org_id", orgId);
 
       return NextResponse.json({ error: msg, workerJobId }, { status: 402 });
     }
 
-    reserved = { method: res.method };
+    reservedMethod = res.method;
 
-    // Update credits_spent now that reservation succeeded
+    // Update credits_spent now that reserve succeeded
     const { error: upErr } = await sb
       .from("user_jobs")
       .update({ credits_spent: COST })
@@ -194,7 +184,7 @@ export async function POST(req: Request) {
       .eq("org_id", orgId);
 
     if (upErr) {
-      await refundCredits(sb, workerJobId, COST, reserved.method);
+      await refundCredits(sb, workerJobId, COST, reservedMethod);
       return NextResponse.json({ error: upErr.message }, { status: 500 });
     }
 
@@ -202,12 +192,11 @@ export async function POST(req: Request) {
   } catch (e: any) {
     const isAbort = e?.name === "AbortError";
 
-    // Best-effort refund if we already reserved
     try {
       const token = getBearer(req);
-      if (token && workerJobId && reserved) {
+      if (token && workerJobId && reservedMethod) {
         const sb = supabaseAuthed(token);
-        await refundCredits(sb, workerJobId, COST, reserved.method);
+        await refundCredits(sb, workerJobId, COST, reservedMethod);
       }
     } catch {
       // ignore

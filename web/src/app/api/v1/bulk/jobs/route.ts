@@ -1,4 +1,3 @@
-// src/app/api/v1/bulk/jobs/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAuthed } from "@/lib/supabase-server";
 
@@ -42,9 +41,8 @@ async function ensureActiveOrg(sb: ReturnType<typeof supabaseAuthed>, userId: st
     const { error: bootErr } = await sb.rpc("bootstrap_org");
     if (bootErr) throw new Error(bootErr.message);
 
-    const { data: prof2, error: err2 } = await sb.from("profiles").select("active_org_id").eq("id", userId).single();
-    if (err2) throw new Error(err2.message);
-
+    const { data: prof2, error: error2 } = await sb.from("profiles").select("active_org_id").eq("id", userId).single();
+    if (error2) throw new Error(error2.message);
     orgId = (prof2 as any)?.active_org_id as string | null;
   }
 
@@ -52,9 +50,11 @@ async function ensureActiveOrg(sb: ReturnType<typeof supabaseAuthed>, userId: st
   return orgId;
 }
 
-async function safeRefundJob(sb: ReturnType<typeof supabaseAuthed>, workerJobId: string, amount: number) {
+async function safeRefund(sb: ReturnType<typeof supabaseAuthed>, workerJobId: string, amount: number) {
   try {
-    await sb.rpc("refund_job_credits", { worker_job_id: workerJobId, amount });
+    const r1 = await sb.rpc("refund_job_credits", { worker_job_id: workerJobId, amount });
+    if (!r1.error) return;
+    await sb.rpc("refund_credits", { amount });
   } catch {
     // ignore
   }
@@ -69,19 +69,16 @@ export async function POST(req: Request) {
 
     const sb = supabaseAuthed(token);
 
-    // IMPORTANT: const user for TS narrowing
-    const { data: userRes, error: uErr } = await sb.auth.getUser();
-    const user = userRes.user;
-    if (uErr || !user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
+    const { data: u, error: uErr } = await sb.auth.getUser();
+    if (uErr || !u.user) return NextResponse.json({ error: "Invalid session" }, { status: 401 });
 
-    const userId = user.id;
+    const userId = u.user.id;
 
     const body = await req.json();
     const urls: string[] = Array.isArray(body?.urls) ? body.urls : [];
     const concurrency = Math.min(Math.max(Number(body?.concurrency || 3), 1), 6);
 
     const clean = urls.map((x) => String(x || "").trim()).filter(Boolean);
-
     if (clean.length === 0) return NextResponse.json({ error: "Provide urls: string[]" }, { status: 400 });
     if (clean.length > 50) return NextResponse.json({ error: "Max 50 URLs per request" }, { status: 400 });
 
@@ -107,12 +104,12 @@ export async function POST(req: Request) {
           90_000
         );
 
-        const txt = await r.text();
+        const raw = await r.text();
         let parsed: any = null;
         try {
-          parsed = JSON.parse(txt);
+          parsed = JSON.parse(raw);
         } catch {
-          parsed = { raw: txt };
+          parsed = { raw };
         }
 
         workerJobId = String(parsed?.jobId || parsed?.id || "").trim();
@@ -120,16 +117,11 @@ export async function POST(req: Request) {
           return { url, ok: false, error: "Worker create failed", workerStatus: r.status, workerBody: parsed };
         }
 
-        // Reserve org credits tied to this worker job
-        const { error: reserveErr } = await sb.rpc("reserve_job_credits", {
-          worker_job_id: workerJobId,
-          amount: COST,
-        });
-
-        if (reserveErr) {
-          const msg = reserveErr.message?.toLowerCase().includes("insufficient")
+        const reserve = await sb.rpc("reserve_job_credits", { worker_job_id: workerJobId, amount: COST });
+        if (reserve.error) {
+          const msg = reserve.error.message?.toLowerCase().includes("insufficient")
             ? "Insufficient credits"
-            : reserveErr.message;
+            : reserve.error.message;
           return { url, ok: false, error: msg, workerJobId, status: 402 };
         }
 
@@ -145,13 +137,13 @@ export async function POST(req: Request) {
         });
 
         if (insErr) {
-          if (reserved) await safeRefundJob(sb, workerJobId, COST);
+          if (reserved) await safeRefund(sb, workerJobId, COST);
           return { url, ok: false, error: insErr.message, workerJobId };
         }
 
         return { url, ok: true, workerJobId };
       } catch (e: any) {
-        if (workerJobId && reserved) await safeRefundJob(sb, workerJobId, COST);
+        if (workerJobId && reserved) await safeRefund(sb, workerJobId, COST);
         const isAbort = e?.name === "AbortError";
         return { url, ok: false, error: isAbort ? "Worker timeout" : e?.message || "Failed" };
       }
