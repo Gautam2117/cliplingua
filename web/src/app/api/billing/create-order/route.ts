@@ -5,20 +5,20 @@ import { getUserFromBearer } from "@/lib/supabaseUserFromBearer";
 
 export const runtime = "nodejs";
 
+type Body = { kind: "seats" | "api"; seatsDelta?: number };
+
 function jsonError(message: string, status = 400) {
   return NextResponse.json({ error: message }, { status });
 }
 
 export async function POST(req: Request) {
   try {
-    const auth = req.headers.get("authorization") || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    // IMPORTANT: your helper expects Request (not token string)
+    const { user, token } = await getUserFromBearer(req);
     if (!token) return jsonError("Missing bearer token", 401);
-
-    const user = await getUserFromBearer(token);
     if (!user) return jsonError("Not authenticated", 401);
 
-    const body = await req.json().catch(() => null);
+    const body = (await req.json().catch(() => null)) as Body | null;
     const kind = body?.kind;
 
     if (kind !== "seats" && kind !== "api") return jsonError("Invalid kind", 400);
@@ -61,6 +61,7 @@ export async function POST(req: Request) {
         .select("api_enabled")
         .eq("id", orgId)
         .single();
+
       if (oErr) return jsonError(oErr.message, 400);
       if (orgRow?.api_enabled) return jsonError("API already enabled", 400);
     }
@@ -68,11 +69,11 @@ export async function POST(req: Request) {
     const amountInr = kind === "seats" ? seatsDelta * seatPriceInr : apiPriceInr;
     if (!Number.isFinite(amountInr) || amountInr <= 0) return jsonError("Invalid amount", 400);
 
-    const keyId = process.env.RAZORPAY_KEY_ID || "";
-    const keySecret = process.env.RAZORPAY_KEY_SECRET || "";
+    const keyId = (process.env.RAZORPAY_KEY_ID || "").trim();
+    const keySecret = (process.env.RAZORPAY_KEY_SECRET || "").trim();
     if (!keyId || !keySecret) return jsonError("Razorpay keys missing", 500);
 
-    const amountPaise = amountInr * 100;
+    const amountPaise = Math.round(amountInr * 100);
 
     const rp = await fetch("https://api.razorpay.com/v1/orders", {
       method: "POST",
