@@ -106,7 +106,7 @@ export async function loadOrgContext(orgId: string): Promise<OrgContext> {
 
   const { data: usageRow, error: uErr } = await supabase
     .from("org_api_usage")
-    .select("day,daily_jobs_used,minute_bucket,minute_reqs_used")
+    .select("day,day_count,minute_bucket,minute_count,updated_at")
     .eq("org_id", orgId)
     .maybeSingle();
 
@@ -119,10 +119,10 @@ export async function loadOrgContext(orgId: string): Promise<OrgContext> {
 
   const minuteUsed =
     usageRow?.minute_bucket && minuteKey(new Date(usageRow.minute_bucket)) === minuteKey(curMinute)
-      ? Number(usageRow.minute_reqs_used || 0)
+      ? Number((usageRow as any).minute_count || 0)
       : 0;
 
-  const dailyUsed = usageRow?.day === today ? Number(usageRow.daily_jobs_used || 0) : 0;
+  const dailyUsed = usageRow?.day === today ? Number((usageRow as any).day_count || 0) : 0;
 
   const minuteLimit = Number(org.api_rpm || 0);
   const dailyLimit = Number(org.api_daily_jobs || 0);

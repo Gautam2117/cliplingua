@@ -1,22 +1,31 @@
-import { createClient } from "@supabase/supabase-js";
+import type { User } from "@supabase/supabase-js";
+import { supabaseAdmin } from "@/lib/supabase-admin";
 
-function getBearer(req: Request) {
-  const h = req.headers.get("authorization") || "";
-  const m = h.match(/^Bearer\s+(.+)$/i);
-  return m?.[1]?.trim() || null;
+export async function getUserFromBearerToken(token: string): Promise<User | null> {
+  if (!token) return null;
+  const { data, error } = await supabaseAdmin.auth.getUser(token);
+  if (error) return null;
+  return data.user ?? null;
 }
 
-export async function getUserFromBearer(req: Request) {
-  const token = getBearer(req);
+/**
+ * Backward-compatible helper:
+ * - pass Request -> extracts Bearer token
+ * - pass string  -> uses it as token
+ */
+export async function getUserFromBearer(
+  reqOrToken: Request | string
+): Promise<{ user: User | null; token: string | null }> {
+  const token =
+    typeof reqOrToken === "string"
+      ? reqOrToken
+      : (() => {
+          const auth = reqOrToken.headers.get("authorization") || "";
+          return auth.startsWith("Bearer ") ? auth.slice(7) : null;
+        })();
+
   if (!token) return { user: null, token: null };
 
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
-  if (!url || !anon) throw new Error("Missing Supabase public env");
-
-  const supabase = createClient(url, anon, { auth: { persistSession: false } });
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return { user: null, token: null };
-
-  return { user: data.user, token };
+  const user = await getUserFromBearerToken(token);
+  return { user, token };
 }

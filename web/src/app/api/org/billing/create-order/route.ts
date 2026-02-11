@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { supabaseAuthed } from "@/lib/supabase-server";
 import { supabaseAdmin } from "@/lib/supabase-admin";
-import { getUserFromBearer } from "@/lib/supabaseUserFromBearer";
+import { getUserFromBearerToken } from "@/lib/supabaseUserFromBearer";
 
 export const runtime = "nodejs";
 
@@ -13,14 +13,15 @@ function jsonError(message: string, status = 400) {
 
 export async function POST(req: Request) {
   try {
-    // IMPORTANT: your helper expects Request (not token string)
-    const { user, token } = await getUserFromBearer(req);
+    const auth = req.headers.get("authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
     if (!token) return jsonError("Missing bearer token", 401);
+
+    const user = await getUserFromBearerToken(token);
     if (!user) return jsonError("Not authenticated", 401);
 
     const body = (await req.json().catch(() => null)) as Body | null;
     const kind = body?.kind;
-
     if (kind !== "seats" && kind !== "api") return jsonError("Invalid kind", 400);
 
     const sb = supabaseAuthed(token);
@@ -43,9 +44,6 @@ export async function POST(req: Request) {
     const seatPriceInr = Number.parseInt(process.env.SEAT_PRICE_INR || "299", 10);
     const apiPriceInr = Number.parseInt(process.env.API_ENABLE_PRICE_INR || "999", 10);
 
-    if (!Number.isFinite(seatPriceInr) || seatPriceInr <= 0) return jsonError("Bad SEAT_PRICE_INR", 500);
-    if (!Number.isFinite(apiPriceInr) || apiPriceInr <= 0) return jsonError("Bad API_ENABLE_PRICE_INR", 500);
-
     const seatsDeltaRaw = kind === "seats" ? Number(body?.seatsDelta || 0) : 0;
     const seatsDelta = Math.max(0, Math.floor(seatsDeltaRaw));
 
@@ -55,13 +53,11 @@ export async function POST(req: Request) {
     }
 
     if (kind === "api") {
-      // Optional: block double purchase
       const { data: orgRow, error: oErr } = await sb
         .from("organizations")
         .select("api_enabled")
         .eq("id", orgId)
         .single();
-
       if (oErr) return jsonError(oErr.message, 400);
       if (orgRow?.api_enabled) return jsonError("API already enabled", 400);
     }
@@ -69,11 +65,11 @@ export async function POST(req: Request) {
     const amountInr = kind === "seats" ? seatsDelta * seatPriceInr : apiPriceInr;
     if (!Number.isFinite(amountInr) || amountInr <= 0) return jsonError("Invalid amount", 400);
 
-    const keyId = (process.env.RAZORPAY_KEY_ID || "").trim();
-    const keySecret = (process.env.RAZORPAY_KEY_SECRET || "").trim();
+    const keyId = process.env.RAZORPAY_KEY_ID || "";
+    const keySecret = process.env.RAZORPAY_KEY_SECRET || "";
     if (!keyId || !keySecret) return jsonError("Razorpay keys missing", 500);
 
-    const amountPaise = Math.round(amountInr * 100);
+    const amountPaise = amountInr * 100;
 
     const rp = await fetch("https://api.razorpay.com/v1/orders", {
       method: "POST",
@@ -91,7 +87,6 @@ export async function POST(req: Request) {
     });
 
     const order = await rp.json().catch(() => null);
-
     if (!rp.ok) {
       const desc = order?.error?.description || order?.message || "Razorpay error";
       return jsonError(desc, 400);

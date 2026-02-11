@@ -1,81 +1,90 @@
 import { NextResponse } from "next/server";
 import { supabaseAuthed } from "@/lib/supabase-server";
-import { getUserFromBearer } from "@/lib/supabaseUserFromBearer";
+import { getUserFromBearerToken } from "@/lib/supabaseUserFromBearer";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
-function isSameMinute(a: string, now: Date) {
-  const ta = new Date(a).getTime();
-  const tn = new Date(now);
-  tn.setSeconds(0, 0);
-  return Math.floor(ta / 60000) === Math.floor(tn.getTime() / 60000);
+function jsonError(message: string, status = 400) {
+  return NextResponse.json({ error: message }, { status });
+}
+
+function minuteKey(d: Date) {
+  // UTC minute key like "2026-02-12T10:34"
+  return d.toISOString().slice(0, 16);
 }
 
 export async function GET(req: Request) {
-  const { user, token } = await getUserFromBearer(req);
-  if (!token) return NextResponse.json({ error: "Missing bearer token" }, { status: 401 });
-  if (!user) return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
+  try {
+    const auth = req.headers.get("authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) return jsonError("Missing bearer token", 401);
 
-  const sb = supabaseAuthed(token);
+    const user = await getUserFromBearerToken(token);
+    if (!user) return jsonError("Not authenticated", 401);
 
-  const { data: profile, error: pErr } = await sb
-    .from("profiles")
-    .select("id, active_org_id")
-    .eq("id", user.id)
-    .single();
+    const sb = supabaseAuthed(token);
 
-  if (pErr) return NextResponse.json({ error: pErr.message }, { status: 400 });
-  if (!profile?.active_org_id) return NextResponse.json({ error: "No active org" }, { status: 400 });
+    const { data: profile, error: pErr } = await sb
+      .from("profiles")
+      .select("active_org_id")
+      .eq("id", user.id)
+      .single();
 
-  const orgId = profile.active_org_id;
+    if (pErr) return jsonError(pErr.message, 400);
 
-  const { data: org, error: oErr } = await sb
-    .from("organizations")
-    .select("id,name,credits,invite_code,plan,seats_purchased,api_enabled,api_rpm,api_daily_jobs,max_api_keys")
-    .eq("id", orgId)
-    .single();
+    const orgId = profile?.active_org_id;
+    if (!orgId) return jsonError("No active org", 400);
 
-  if (oErr) return NextResponse.json({ error: oErr.message }, { status: 400 });
+    const { data: org, error: oErr } = await sb
+      .from("organizations")
+      .select("id,name,plan,seats_purchased,api_enabled,api_rpm,api_daily_jobs,max_api_keys,credits")
+      .eq("id", orgId)
+      .single();
 
-  const { count: membersCount, error: mErr } = await sb
-    .from("org_members")
-    .select("user_id", { count: "exact", head: true })
-    .eq("org_id", orgId);
+    if (oErr) return jsonError(oErr.message, 400);
 
-  if (mErr) return NextResponse.json({ error: mErr.message }, { status: 400 });
+    const { count: membersCount, error: mErr } = await sb
+      .from("org_members")
+      .select("user_id", { count: "exact", head: true })
+      .eq("org_id", orgId);
 
-  const { data: usageRow, error: uErr } = await sb
-    .from("org_api_usage")
-    .select("day,day_count,minute_bucket,minute_count,updated_at")
-    .eq("org_id", orgId)
-    .maybeSingle();
+    if (mErr) return jsonError(mErr.message, 400);
 
-  if (uErr) return NextResponse.json({ error: uErr.message }, { status: 400 });
+    // Correct column names based on your schema:
+    // org_id, minute_bucket, minute_count, day, day_count, updated_at
+    const { data: usageRow, error: uErr } = await sb
+      .from("org_api_usage")
+      .select("minute_bucket,minute_count,day,day_count,updated_at")
+      .eq("org_id", orgId)
+      .maybeSingle();
 
-  const now = new Date();
-  const todayISO = now.toISOString().slice(0, 10);
+    if (uErr) return jsonError(uErr.message, 400);
 
-  const minuteUsed =
-    usageRow?.minute_bucket && isSameMinute(usageRow.minute_bucket, now)
-      ? Number(usageRow.minute_count || 0)
-      : 0;
+    const now = new Date();
+    const todayISO = now.toISOString().slice(0, 10);
 
-  const dailyUsed = usageRow?.day === todayISO ? Number(usageRow.day_count || 0) : 0;
+    const curMinKey = minuteKey(now);
+    const rowMinKey = usageRow?.minute_bucket ? minuteKey(new Date(usageRow.minute_bucket)) : null;
 
-  return NextResponse.json({
-    org,
-    seats: {
-      used: membersCount || 0,
-      purchased: org?.seats_purchased ?? 0,
-    },
-    api: {
-      enabled: !!org?.api_enabled,
-      rpmLimit: org?.api_rpm ?? 0,
-      dailyJobsLimit: org?.api_daily_jobs ?? 0,
-      maxKeys: org?.max_api_keys ?? 0,
-      minuteUsed,
-      dailyUsed,
-    },
-  });
+    const minuteUsed = rowMinKey === curMinKey ? Number(usageRow?.minute_count || 0) : 0;
+    const dailyUsed = usageRow?.day === todayISO ? Number(usageRow?.day_count || 0) : 0;
+
+    return NextResponse.json({
+      org,
+      seats: {
+        used: membersCount || 0,
+        purchased: org?.seats_purchased ?? 0,
+      },
+      api: {
+        enabled: !!org?.api_enabled,
+        rpmLimit: org?.api_rpm ?? 0,
+        dailyJobsLimit: org?.api_daily_jobs ?? 0,
+        maxKeys: org?.max_api_keys ?? 0,
+        minuteUsed,
+        dailyUsed,
+      },
+    });
+  } catch (e: any) {
+    return jsonError(e?.message || "Server error", 500);
+  }
 }
