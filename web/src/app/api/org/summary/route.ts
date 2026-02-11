@@ -2,16 +2,23 @@ import { NextResponse } from "next/server";
 import { supabaseAuthed } from "@/lib/supabase-server";
 import { getUserFromBearer } from "@/lib/supabaseUserFromBearer";
 
-function sameMinute(a: string, b: Date) {
-  return new Date(a).getTime() === new Date(b.toISOString()).getTime();
+export const runtime = "nodejs";
+
+function sameMinute(ts: string, minuteStart: Date) {
+  const d = new Date(ts);
+  const a = new Date(d);
+  a.setSeconds(0, 0);
+
+  const b = new Date(minuteStart);
+  b.setSeconds(0, 0);
+
+  return a.getTime() === b.getTime();
 }
 
 export async function GET(req: Request) {
-  const auth = req.headers.get("authorization") || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  // IMPORTANT: pass Request (not token string)
+  const { user, token } = await getUserFromBearer(req);
   if (!token) return NextResponse.json({ error: "Missing bearer token" }, { status: 401 });
-
-  const user = await getUserFromBearer(token);
   if (!user) return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
 
   const sb = supabaseAuthed(token);
@@ -54,11 +61,11 @@ export async function GET(req: Request) {
 
   const minuteUsed =
     usageRow?.minute_bucket && sameMinute(usageRow.minute_bucket, curMinute)
-      ? usageRow.minute_reqs_used
+      ? Number(usageRow.minute_reqs_used || 0)
       : 0;
 
   const todayISO = now.toISOString().slice(0, 10);
-  const dailyUsed = usageRow?.day === todayISO ? usageRow.daily_jobs_used : 0;
+  const dailyUsed = usageRow?.day === todayISO ? Number(usageRow.daily_jobs_used || 0) : 0;
 
   return NextResponse.json({
     org,
