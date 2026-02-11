@@ -3,20 +3,16 @@ import { supabaseAuthed } from "@/lib/supabase-server";
 import { getUserFromBearer } from "@/lib/supabaseUserFromBearer";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-function sameMinute(ts: string, minuteStart: Date) {
-  const d = new Date(ts);
-  const a = new Date(d);
-  a.setSeconds(0, 0);
-
-  const b = new Date(minuteStart);
-  b.setSeconds(0, 0);
-
-  return a.getTime() === b.getTime();
+function isSameMinute(a: string, now: Date) {
+  const ta = new Date(a).getTime();
+  const tn = new Date(now);
+  tn.setSeconds(0, 0);
+  return Math.floor(ta / 60000) === Math.floor(tn.getTime() / 60000);
 }
 
 export async function GET(req: Request) {
-  // IMPORTANT: pass Request (not token string)
   const { user, token } = await getUserFromBearer(req);
   if (!token) return NextResponse.json({ error: "Missing bearer token" }, { status: 401 });
   if (!user) return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
@@ -36,7 +32,7 @@ export async function GET(req: Request) {
 
   const { data: org, error: oErr } = await sb
     .from("organizations")
-    .select("id,name,plan,seats_purchased,api_enabled,api_rpm,api_daily_jobs,max_api_keys")
+    .select("id,name,credits,invite_code,plan,seats_purchased,api_enabled,api_rpm,api_daily_jobs,max_api_keys")
     .eq("id", orgId)
     .single();
 
@@ -49,23 +45,23 @@ export async function GET(req: Request) {
 
   if (mErr) return NextResponse.json({ error: mErr.message }, { status: 400 });
 
-  const { data: usageRow } = await sb
+  const { data: usageRow, error: uErr } = await sb
     .from("org_api_usage")
-    .select("day,daily_jobs_used,minute_bucket,minute_reqs_used")
+    .select("day,day_count,minute_bucket,minute_count,updated_at")
     .eq("org_id", orgId)
     .maybeSingle();
 
+  if (uErr) return NextResponse.json({ error: uErr.message }, { status: 400 });
+
   const now = new Date();
-  const curMinute = new Date(now);
-  curMinute.setSeconds(0, 0);
+  const todayISO = now.toISOString().slice(0, 10);
 
   const minuteUsed =
-    usageRow?.minute_bucket && sameMinute(usageRow.minute_bucket, curMinute)
-      ? Number(usageRow.minute_reqs_used || 0)
+    usageRow?.minute_bucket && isSameMinute(usageRow.minute_bucket, now)
+      ? Number(usageRow.minute_count || 0)
       : 0;
 
-  const todayISO = now.toISOString().slice(0, 10);
-  const dailyUsed = usageRow?.day === todayISO ? Number(usageRow.daily_jobs_used || 0) : 0;
+  const dailyUsed = usageRow?.day === todayISO ? Number(usageRow.day_count || 0) : 0;
 
   return NextResponse.json({
     org,
