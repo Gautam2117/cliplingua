@@ -176,7 +176,7 @@ export default function DashboardClient() {
     try {
       const { data: uRow } = await supabase
         .from("org_api_usage")
-        .select("minute_used,day_used,minute_window_start,day_date,updated_at")
+        .select("minute_bucket,minute_count,day,day_count,updated_at")
         .eq("org_id", orgId)
         .maybeSingle();
 

@@ -4,13 +4,18 @@ import { supabaseAuthed } from "@/lib/supabase-server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+function jsonError(message: string, status = 400) {
+  return NextResponse.json({ error: message }, { status });
+}
+
 function getWorkerBaseUrl() {
   const base =
     process.env.WORKER_BASE_URL?.trim() ||
     process.env.NEXT_PUBLIC_WORKER_BASE_URL?.trim() ||
     process.env.WORKER_URL?.trim() ||
     "";
-  if (!base) throw new Error("WORKER_BASE_URL not set");
+  if (!base) return jsonError("WORKER_BASE_URL missing", 500);
+
   return base.replace(/\/+$/, "");
 }
 

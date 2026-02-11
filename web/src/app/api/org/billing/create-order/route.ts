@@ -70,6 +70,9 @@ export async function POST(req: Request) {
     if (!keyId || !keySecret) return jsonError("Razorpay keys missing", 500);
 
     const amountPaise = amountInr * 100;
+    const shortOrg = orgId.replace(/-/g, "").slice(0, 10); // 10 chars
+    const shortTs = Date.now().toString(36);              // shorter than ms digits
+    const receipt = `o_${shortOrg}_${shortTs}`.slice(0, 40);
 
     const rp = await fetch("https://api.razorpay.com/v1/orders", {
       method: "POST",
@@ -80,7 +83,7 @@ export async function POST(req: Request) {
       body: JSON.stringify({
         amount: amountPaise,
         currency: "INR",
-        receipt: `org_${orgId}_${Date.now()}`,
+        receipt: receipt,
         payment_capture: 1,
         notes: { orgId, kind, seatsDelta: String(seatsDelta) },
       }),
