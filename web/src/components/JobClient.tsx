@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
+import { fetchClips } from "@/lib/fetchClips";
 
 type JobStatus = "queued" | "running" | "done" | "error";
 
@@ -135,6 +136,15 @@ export default function JobClient({
 
   const [ytUploading, setYtUploading] = useState(false);
   const [ytUploadedUrl, setYtUploadedUrl] = useState<string | null>(null);
+
+  type Clip = {
+    id: string;
+    start_sec: number;
+    end_sec: number;
+    signedUrl: string | null;
+  };
+  const [clips, setClips] = useState<Clip[]>([]);
+  const [clipsLoading, setClipsLoading] = useState(false);
 
   const clearTimer = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current);
@@ -293,11 +303,22 @@ export default function JobClient({
     safeOpen(url);
   }
 
+   useEffect(() => {
+    if (!jobId) return;
+    if (job?.status !== "done") return;          // not ready
+    setClipsLoading(true);
+    fetchClips(jobId)
+      .then(setClips)
+      .catch(() => {})                           // silence errors for now
+      .finally(() => setClipsLoading(false));
+  }, [jobId, job?.status]);
+
   async function createJob() {
     setMsg(null);
     setCreating(true);
     setJob(null);
     setJobId(null);
+    setClips([]);
     setActiveDubLang(null);
     clearTimer();
     abortInFlight();
@@ -666,6 +687,28 @@ export default function JobClient({
                       {ytUploadedUrl}
                     </a>
                   </p>
+                )}
+                {/* ---------- auto-clips grid ---------- */}
+                {clipsLoading && <p className="mt-4 text-sm opacity-70">Loading clips…</p>}
+
+                {clips.length > 0 && (
+                  <section className="mt-6">
+                    <h3 className="mb-2 font-semibold">Auto-clips</h3>
+                    <div className="grid gap-4 md:grid-cols-3">
+                      {clips.map((c) => (
+                        <video
+                          key={c.id}
+                          src={c.signedUrl ?? ""}
+                          controls
+                          className="w-full rounded-lg shadow"
+                        />
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                {clips.length === 0 && !clipsLoading && (
+                  <p className="mt-4 text-sm opacity-70">No clips yet – refresh in a minute.</p>
                 )}
 
               </div>

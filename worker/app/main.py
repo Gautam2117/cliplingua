@@ -32,6 +32,7 @@ import re
 import wave
 import math
 import numpy as np
+from decimal import Decimal  # NEW
 
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
@@ -106,6 +107,12 @@ EDGE_TTS_PITCH = (os.getenv("EDGE_TTS_PITCH") or "+0Hz").strip()
 
 BUILD_TAG = (os.getenv("BUILD_TAG") or "").strip() or None
 
+# -------------  auto-clipper -------------
+ENABLE_AUTO_CLIPPER = (os.getenv("ENABLE_AUTO_CLIPPER", "1").lower() in {"1", "true", "yes"})
+CLIP_MAX_SEC = int(os.getenv("CLIP_MAX_SEC", "60"))      # hard ceiling
+CLIP_MIN_SEC = int(os.getenv("CLIP_MIN_SEC", "15"))      # discard if shorter
+CLIPS_BUCKET = os.getenv("CLIPS_BUCKET", "clips-out").strip()
+
 app = FastAPI(title="ClipLingua Worker", version="0.9.1-timed-dub")
 
 # -----------------------------------------------------------------------------
@@ -169,6 +176,26 @@ def sb_get_youtube_refresh_token(user_id: str) -> Optional[str]:
             return rt or None
         return None
     except Exception:
+        return None
+
+def sb_upload_clip(job_id: str, idx: int, local_path: Path) -> Optional[str]:
+    """
+    Upload one short clip into the CLIPS_BUCKET.
+    Returns the storage key or None.
+    """
+    if not _supabase:
+        return None
+    key = f"{job_id}/clip_{idx:03d}.mp4"
+    try:
+        with open(local_path, "rb") as f:
+            _supabase.storage.from_(CLIPS_BUCKET).upload(
+                path=key,
+                file=f,
+                file_options={"cache-control": "31536000", "content-type": "video/mp4", "upsert": "true"},
+            )
+        return key
+    except Exception as e:
+        print(f"WARNING: clip upload failed: {e}")
         return None
 
 
@@ -1833,6 +1860,78 @@ def process_job(job_id: str, url: str) -> None:
             audio_key = sb_upload_file(job_id, paths["audio"], "audio.wav", "audio/wav")
             log_key = sb_upload_file(job_id, paths["log"], "log.txt", "text/plain")
 
+            # -------------  AUTO-CLIPPER  -------------
+            if ENABLE_AUTO_CLIPPER:
+                auto_clip_video(job_id, paths["video"], log_fn=lambda line: sb_append_log(job_id, line))
+            # ------------------------------------------
+
+            # ---------------------------------------------
+            # Auto-clipper (generate Shorts candidates)
+            # ---------------------------------------------
+            try:
+                max_clip_sec   = 60.0
+                min_clip_sec   = 15.0
+                overlap_margin = 1.0      # seconds, to include full words
+
+                # Rough heuristic: slice the transcript every ~45 s, word-aligned
+                tr = whisper_transcribe(paths["audio"])
+                segs = merge_whisper_segments(tr.get("segments", []))
+                clips: List[Tuple[float, float]] = []
+
+                cursor = 0.0
+                current: List[dict] = []
+                for s in segs:
+                    if s["start"] < cursor:
+                        continue
+                    if not current:
+                        current.append(s)
+                        continue
+                    dur = s["end"] - current[0]["start"]
+                    if dur >= max_clip_sec:
+                        clips.append((current[0]["start"],
+                                    min(current[-1]["end"], current[0]["start"]+max_clip_sec)))
+                        current = [s]
+                    else:
+                        current.append(s)
+
+                # flush tail
+                if current:
+                    dur = current[-1]["end"] - current[0]["start"]
+                    if dur >= min_clip_sec:
+                        clips.append((current[0]["start"], current[-1]["end"]))
+
+                ffmpeg_bin = require_bin("ffmpeg")
+                for c_start, c_end in clips[:20]:          # safety cap
+                    cid = str(uuid.uuid4())
+                    out_mp4 = job_dir(job_id) / "clips" / f"{cid}.mp4"
+                    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+
+                    rc, _ = run_cmd([
+                        ffmpeg_bin, "-y",
+                        "-ss", f"{max(0,c_start-overlap_margin):.3f}",
+                        "-to", f"{c_end+overlap_margin:.3f}",
+                        "-i", str(paths["video"]),
+                        "-c:v", "copy",
+                        "-c:a", "copy",
+                        str(out_mp4)
+                    ])
+                    if rc != 0 or out_mp4.stat().st_size < 500_000:
+                        continue  # skip bad slice
+
+                    key = storage_key(job_id, f"clips/{cid}.mp4")
+                    sb_upload_file(job_id, out_mp4, f"clips/{cid}.mp4", "video/mp4")
+
+                    _supabase.table("clip_segments").insert({
+                        "job_id":          job_id,
+                        "org_id":          job.get("org_id"),
+                        "creator_user_id": job.get("user_id"),
+                        "start_sec":       Decimal(f"{c_start:.3f}"),
+                        "end_sec":         Decimal(f"{c_end:.3f}"),
+                        "storage_key":     key
+                    }).execute()
+            except Exception as ce:
+                sb_append_log(job_id, f"\nAUTO_CLIPPER_ERROR: {ce}\n")
+
             update_job(job_id, {"storage_video_key": video_key, "storage_audio_key": audio_key, "storage_log_key": log_key})
             update_job(
                 job_id,
@@ -1980,6 +2079,70 @@ def ensure_base_artifacts_local(job_id: str, job: Dict[str, Any]) -> Tuple[Path,
         update_job(job_id, patch)
 
     return video_p, audio_p
+
+# -----------------------------------------------------------------------------  
+# Auto-clipper  (simple time-slice 15-60 s)  
+# -----------------------------------------------------------------------------  
+  
+def compute_cut_points(video_len: float) -> List[Tuple[float, float]]:  
+    """
+    naive slicer: cut at CLIP_MAX_SEC, keep tail if ≥ CLIP_MIN_SEC
+    """  
+    pts: List[Tuple[float, float]] = []  
+    t0 = 0.0  
+    while t0 + CLIP_MIN_SEC < video_len:  
+        t1 = min(t0 + CLIP_MAX_SEC, video_len)  
+        pts.append((t0, t1))  
+        t0 = t1  
+    return pts  
+  
+def auto_clip_video(job_id: str, video_in: Path, log_fn=print) -> None:  
+    ffmpeg = require_bin("ffmpeg")  
+    vd = video_duration_seconds(video_in) or 0.0  
+    if vd <= CLIP_MIN_SEC:  
+        log_fn(f"auto_clip: video too short ({vd:.1f}s) – skip")  
+        return  
+  
+    segs = compute_cut_points(vd)  
+    log_fn(f"auto_clip: segments={len(segs)} total_dur={vd:.1f}s")  
+  
+    clips_local: List[Path] = []  
+    out_dir = job_dir(job_id) / "clips"  
+    out_dir.mkdir(parents=True, exist_ok=True)  
+  
+    for idx, (st, et) in enumerate(segs):  
+        out_p = out_dir / f"clip_{idx:03d}.mp4"  
+        cmd = [  
+            ffmpeg, "-y",  
+            "-ss", f"{st:.3f}", "-to", f"{et:.3f}",  
+            "-i", str(video_in),  
+            "-c", "copy",  
+            str(out_p),  
+        ]  
+        rc, _ = run_cmd(cmd)  
+        if rc == 0 and out_p.exists() and out_p.stat().st_size > 10_000:  
+            clips_local.append(out_p)  
+  
+    if not clips_local:  
+        log_fn("auto_clip: no clips produced")  
+        return  
+  
+    log_fn(f"auto_clip: uploading {len(clips_local)} clips …")  
+    for idx, p in enumerate(clips_local):  
+        key = sb_upload_clip(job_id, idx, p)  
+        if key:  
+            try:  
+                _supabase.table("clip_segments").upsert({  
+                    "job_id": job_id,  
+                    "idx": idx,  
+                    "start_sec": float(segs[idx][0]),  
+                    "end_sec": float(segs[idx][1]),  
+                    "storage_key": key,  
+                }).execute()  
+            except Exception as e:  
+                log_fn(f"clip_segments insert failed idx={idx} err={e}")  
+  
+    log_fn("auto_clip: done")  
 
 
 # -----------------------------------------------------------------------------
